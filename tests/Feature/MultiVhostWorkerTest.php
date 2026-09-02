@@ -114,7 +114,7 @@ describe('multi-vhost worker', function () {
 
     it('subscription enabled flag must be boolean', function () {
         $config = multiVhostConfig();
-        $config['workers']['main']['subscriptions']['disabled_legacy']['enabled'] = 'false';
+        $config['workers']['main']['subscriptions']['disabled_legacy']['enabled'] = 'maybe';
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('workers.main.subscriptions.disabled_legacy.enabled');
@@ -201,14 +201,14 @@ function multiVhostConfig(): array
                 'hosts' => ['orders-rabbit:5672'],
                 'vhost' => '/orders-eu',
                 'credentials' => $credentials,
-                'tls' => ['enabled' => false, 'server_name' => null],
+                'tls' => ['enabled' => false],
                 'heartbeat' => 30,
             ],
             'billing_us' => [
                 'hosts' => ['billing-rabbit:5672'],
                 'vhost' => '/billing-us',
                 'credentials' => $credentials,
-                'tls' => ['enabled' => false, 'server_name' => null],
+                'tls' => ['enabled' => false],
                 'heartbeat' => 30,
             ],
         ],

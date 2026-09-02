@@ -2,37 +2,177 @@
 
 declare(strict_types=1);
 
+use Goopil\RabbitRs\ConnectionException;
 use Goopil\RabbitRs\Laravel\Config\ConfigNormalizer;
 use Goopil\RabbitRs\Laravel\Connectors\RabbitMqConnector;
+use Goopil\RabbitRs\Laravel\Exceptions\QueueException;
 use Goopil\RabbitRs\Laravel\Jobs\RabbitMqJob;
-use Goopil\RabbitRs\Laravel\RabbitMqQueue;
 use Goopil\RabbitRs\Laravel\Support\NativePoolFactory;
 use Goopil\RabbitRs\Pool;
 
-const TOXIPROXY_API = 'http://localhost:8474';
-const MGMT_API = 'http://localhost:15672';
-const ADMIN_USER = 'admin';
-const ADMIN_PASS = 'admin_lab';
-const PROXY_1 = 'rabbitmq-1-toxiproxy';
+/*
+ * Toxiproxy is a lab-owned service (lab/rabbitmq/compose.yaml), bound to a
+ * lab-unique port (18474 — the conventional 8474 is frequently grabbed by
+ * unrelated projects). The suite pins itself to that instance in two steps:
+ *
+ *  1. identity: the fingerprint proxy "rabbitmq-1" must exist and upstream to
+ *     the lab node rabbitmq-1:5672 — a foreign Toxiproxy on the port fails
+ *     loudly instead of silently receiving toxics meant for RabbitMQ;
+ *  2. isolation: every toxic scenario creates its own proxy (unique name,
+ *     listen port in the lab's 24504-24509 range) and deletes it in teardown,
+ *     so toxics only ever hit connections this suite opened.
+ *
+ * Toxiproxy absence is a hard failure, not a skip: a chaos scenario that does
+ * not exercise any failure is a vacuous pass.
+ */
+const TOXIPROXY_API_DEFAULT = 'http://localhost:18474';
+const LAB_FINGERPRINT_PROXY = 'rabbitmq-1';
+const LAB_FINGERPRINT_UPSTREAM = 'rabbitmq-1:5672';
+const TOXIPROXY_PROXIES_PATH = '/proxies';
+const CHAOS_PROXY_PORT_MIN = 24504;
+const CHAOS_PROXY_PORT_MAX = 24509;
 const PRIMARY_NODE = 'rabbit@rabbitmq-1';
 
-function resetToxiproxy(): void
+function toxiproxyApi(): string
 {
-    $ch = curl_init(TOXIPROXY_API . '/reset');
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-    curl_exec($ch);
-    curl_close($ch);
+    $api = getenv('RABBIT_RS_TOXIPROXY_API');
+
+    return $api === false || $api === '' ? TOXIPROXY_API_DEFAULT : $api;
 }
 
-function addToxic(
-    string $name,
-    string $type,
-    string $stream,
-    float $toxicity,
-    int $timeoutMs = 0,
-): void {
+/**
+ * @return array{int, string} [HTTP status, response body]
+ */
+function toxiproxyRequest(string $method, string $path, ?string $payload = null): array
+{
+    $ch = curl_init(toxiproxyApi() . $path);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    if ($payload !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    }
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+
+    return [$status, $body === false ? '' : $body];
+}
+
+/**
+ * Fails the test unless the Toxiproxy answering on the API port is the lab's
+ * own instance, proven by the rabbitmq-1 fingerprint proxy upstream.
+ */
+function assertLabToxiproxy(): void
+{
+    [$status, $body] = toxiproxyRequest('GET', TOXIPROXY_PROXIES_PATH . '/' . LAB_FINGERPRINT_PROXY);
+
+    if ($status === 404) {
+        \PHPUnit\Framework\Assert::fail(sprintf(
+            '%s answers but has no lab fingerprint proxy "%s" (upstream %s): this is not the lab Toxiproxy. '
+                .'A foreign instance must never receive toxics meant for RabbitMQ. '
+                .'Start the lab with ./scripts/lab-up.sh',
+            toxiproxyApi(),
+            LAB_FINGERPRINT_PROXY,
+            LAB_FINGERPRINT_UPSTREAM,
+        ));
+    }
+
+    if ($status !== 200) {
+        \PHPUnit\Framework\Assert::fail(sprintf(
+            'the lab Toxiproxy is not reachable at %s (HTTP %d); chaos scenarios refuse to run without '
+                .'a lab-owned instance because injecting toxics elsewhere proves nothing. '
+                .'Start the lab with ./scripts/lab-up.sh',
+            toxiproxyApi(),
+            $status,
+        ));
+    }
+
+    $upstream = json_decode($body, true)['upstream'] ?? '';
+    if ($upstream !== LAB_FINGERPRINT_UPSTREAM) {
+        \PHPUnit\Framework\Assert::fail(sprintf(
+            '%s is answered by a foreign Toxiproxy (%s upstream is "%s", expected "%s"); '
+                .'refusing to inject toxics into infrastructure this suite does not own',
+            toxiproxyApi(),
+            LAB_FINGERPRINT_PROXY,
+            $upstream === '' ? 'none' : $upstream,
+            LAB_FINGERPRINT_UPSTREAM,
+        ));
+    }
+}
+
+/**
+ * Creates a private proxy upstream to the lab's rabbitmq-1 node and returns
+ * its name and host listen port. Listen-port conflicts (concurrent suites)
+ * are retried on other ports from the lab's dedicated range.
+ *
+ * @return array{name: string, port: int}
+ */
+function createChaosProxy(): array
+{
+    $name = 'chaos-'.uniqid('', true);
+
+    for ($attempt = 0; $attempt < 4; $attempt++) {
+        $port = random_int(CHAOS_PROXY_PORT_MIN, CHAOS_PROXY_PORT_MAX);
+        [$status] = toxiproxyRequest('POST', TOXIPROXY_PROXIES_PATH, json_encode([
+            'name' => $name,
+            'listen' => '0.0.0.0:'.$port,
+            'upstream' => LAB_FINGERPRINT_UPSTREAM,
+            'enabled' => true,
+        ]));
+
+        if ($status === 200 || $status === 201) {
+            return ['name' => $name, 'port' => $port];
+        }
+    }
+
+    \PHPUnit\Framework\Assert::fail(sprintf(
+        'could not create chaos proxy %s on %s (all candidate listen ports busy): HTTP %s',
+        $name,
+        toxiproxyApi(),
+        $status,
+    ));
+}
+
+function deleteChaosProxy(string $name): void
+{
+    toxiproxyRequest('DELETE', TOXIPROXY_PROXIES_PATH.'/'.$name);
+}
+
+/**
+ * Opens (or reopens) the suite's pool through the optional chaos proxy and
+ * assigns it to $test->pool / $test->queue.
+ */
+function openChaosPool($test, $app, ?array $brokerHosts = null): void
+{
+    [$test->pool, $test->queue] = integrationPoolAndQueue(
+        $app,
+        $test->queueName,
+        connectOverrides: ['block_for' => 10],
+        connectionName: 'rabbit-rs-chaos',
+        brokerHosts: $brokerHosts,
+    );
+}
+
+/**
+ * Routes the test's pool through a private proxy: the pool's broker host
+ * becomes the proxy's listen port, so every injected toxic affects exactly
+ * the connections this test opened. The proxy is deleted in afterEach().
+ */
+function useChaosProxy($test, $app): void
+{
+    assertLabToxiproxy();
+
+    closePoolQuietly(isset($test->pool) ? $test->pool : null);
+    $proxy = createChaosProxy();
+    $test->chaosProxy = $proxy['name'];
+
+    openChaosPool($test, $app, ['127.0.0.1:'.$proxy['port']]);
+}
+
+function addToxic(string $proxy, string $name, string $type, string $stream, float $toxicity, int $timeoutMs = 0): void
+{
     $payload = json_encode([
         'name' => $name,
         'type' => $type,
@@ -43,37 +183,51 @@ function addToxic(
             : [],
     ]);
 
-    $ch = curl_init(TOXIPROXY_API . '/proxies/' . PROXY_1 . '/toxics');
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-    curl_exec($ch);
-    curl_close($ch);
+    [$status, $body] = toxiproxyRequest('POST', TOXIPROXY_PROXIES_PATH.'/'.$proxy.'/toxics', $payload);
+
+    // A toxic that fails to apply would turn the scenario into a vacuous
+    // pass; fail loudly instead.
+    if ($status !== 200) {
+        \PHPUnit\Framework\Assert::fail(sprintf(
+            'toxic %s was not applied to proxy %s (HTTP %d): %s',
+            $name,
+            $proxy,
+            $status,
+            $body,
+        ));
+    }
 }
 
-function removeToxic(string $name): void
+function removeToxic(string $proxy, string $name): void
 {
-    $ch = curl_init(TOXIPROXY_API . '/proxies/' . PROXY_1 . '/toxics/' . $name);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-    curl_exec($ch);
-    curl_close($ch);
+    toxiproxyRequest('DELETE', TOXIPROXY_PROXIES_PATH.'/'.$proxy.'/toxics/'.$name);
+}
+
+/**
+ * Cuts the connection on BOTH proxy legs. Timeout toxics close the sockets
+ * after the delay, so the broker learns the consumer vanished (and requeues
+ * the unacked message) while the client sees its socket die too — a
+ * single-leg reset_peer leaves the other side half-open on an idle
+ * connection and neither side ever notices. Both toxics are applied with a
+ * loud 200 check.
+ */
+function addConnectionKill(string $proxy, string $name, int $timeoutMs): void
+{
+    addToxic($proxy, $name.'-up', 'timeout', 'upstream', 1.0, $timeoutMs);
+    addToxic($proxy, $name.'-down', 'timeout', 'downstream', 1.0, $timeoutMs);
+}
+
+function removeConnectionKill(string $proxy, string $name): void
+{
+    removeToxic($proxy, $name.'-up');
+    removeToxic($proxy, $name.'-down');
 }
 
 function getQueueLeader(string $queue): string
 {
-    $url = MGMT_API . '/api/queues/%2Forders-eu/' . urlencode($queue);
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_USERPWD, ADMIN_USER . ':' . ADMIN_PASS);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    $resp = curl_exec($ch);
-    curl_close($ch);
+    $body = managementRequest('GET', 'http://localhost:15672/api/queues/%2Forders-eu/'.urlencode($queue));
+    $data = json_decode($body, true);
 
-    $data = json_decode($resp, true);
     return $data['leader'] ?? PRIMARY_NODE;
 }
 
@@ -106,23 +260,155 @@ function nodeToContainer(string $node): string
     return "rabbitrs-{$suffix}-1";
 }
 
-function recreatePool($test): void
+function recreatePool($test, $app): void
 {
-    if (isset($test->pool) && ! $test->pool->stats()['closed']) {
-        $test->pool->close();
+    closePoolQuietly(isset($test->pool) ? $test->pool : null);
+
+    openChaosPool($test, $app);
+}
+
+/**
+ * Reads the pool's connection/ack counters. A pool whose connection was
+ * bounced by a chaos scenario can throw from stats(); nulls mean "unknown".
+ *
+ * @return array{?int, ?int} [reconnects_total, acks_total]
+ */
+function poolCounters(?Pool $pool): array
+{
+    if ($pool === null) {
+        return [null, null];
     }
 
-    $config = liveConfig($test->queueName);
-    $normalized = ConfigNormalizer::normalize($config);
-    $test->pool = new Pool($normalized['native']);
-    $factory = new NativePoolFactory(createPool: fn (): Pool => $test->pool);
-    $connector = new RabbitMqConnector($factory, $normalized);
-    $test->queue = $connector->connect([
-        'queue' => $test->queueName,
-        'block_for' => 10,
-    ]);
-    $test->queue->setContainer($test->app);
-    $test->queue->setConnectionName('rabbit-rs-chaos');
+    try {
+        $stats = $pool->stats();
+    } catch (\Throwable) {
+        return [null, null];
+    }
+
+    return [$stats['reconnects_total'] ?? null, $stats['acks_total'] ?? null];
+}
+
+/**
+ * Pops one job, tolerating the one-shot retired-consumer errors a connection
+ * bump produces (the queue evicts the cache and re-fetches on the next pop —
+ * see ConsumerRejoinTest). Returns null when nothing arrives within the
+ * deadline.
+ */
+function popDelivery($test, int $timeoutSec = 30): ?object
+{
+    $deadline = microtime(true) + $timeoutSec;
+    while (microtime(true) < $deadline) {
+        try {
+            $job = $test->queue->pop();
+            if ($job !== null) {
+                return $job;
+            }
+        } catch (QueueException | ConnectionException) {
+            // expected while the retired handle's error surfaces
+        }
+        usleep(100000);
+    }
+
+    return null;
+}
+
+/**
+ * Pops and verifies a job's payload after a chaos scenario. Fails the test
+ * when nothing is delivered (at-least-once violation).
+ */
+function consumeDeliveredMessage($test, string $expectedMessage, string $description): object
+{
+    $job = popDelivery($test);
+    $test->assertNotNull($job, $description);
+
+    $body = json_decode($job->getRawBody(), true);
+    expect($body['data']['msg'])->toBe($expectedMessage);
+    $job->delete();
+
+    return $job;
+}
+
+/**
+ * Drains every currently available job and returns their payload messages,
+ * tolerating retired-consumer errors the same way popDelivery() does.
+ */
+function drainDeliveredMessages($test): array
+{
+    $received = [];
+    $deadline = microtime(true) + 30;
+    while (microtime(true) < $deadline) {
+        try {
+            $job = $test->queue->pop();
+        } catch (QueueException | ConnectionException) {
+            usleep(100000);
+            continue;
+        }
+        if ($job === null) {
+            break;
+        }
+        $body = json_decode($job->getRawBody(), true);
+        $received[] = $body['data']['msg'] ?? '';
+        $job->delete();
+    }
+
+    return $received;
+}
+
+/**
+ * Publishes tolerating the connection failures an active toxic produces.
+ * Returns whether the publish went through; callers retry after recovery.
+ */
+function pushAllowingFailure($queue, string $msg): bool
+{
+    try {
+        $queue->push('stdClass', ['msg' => $msg]);
+
+        return true;
+    } catch (\Throwable) {
+        return false; // publish may fail during the outage
+    }
+}
+
+/**
+ * Applies a both-legs connection kill, lets the resets fire, removes the
+ * toxics.
+ */
+function fireConnectionKill(string $proxy, string $name, int $timeoutMs): void
+{
+    addConnectionKill($proxy, $name, $timeoutMs);
+    usleep(300000); // let the resets fire
+    removeConnectionKill($proxy, $name);
+}
+
+/**
+ * Drains the queue and asserts every message arrived (at-least-once).
+ */
+function assertAllDelivered($test, array $messages, string $label): void
+{
+    $received = drainDeliveredMessages($test);
+    foreach ($messages as $msg) {
+        $test->assertContains($msg, $received, 'missing '.$msg);
+    }
+    echo "\n[".$label.'] PASS: missing = 0'."\n";
+}
+
+/**
+ * Closes a pool best-effort. A pool whose broker connection was bounced by a
+ * chaos scenario (or already closed by the test body) can throw from
+ * stats()/close() (lapin reports an unexpected connection state) even though
+ * the handle is released internally. Cleanup must never mask the test outcome.
+ */
+function closePoolQuietly(?Pool $pool): void
+{
+    if ($pool === null) {
+        return;
+    }
+
+    try {
+        $pool->close();
+    } catch (\Throwable) {
+        // best-effort cleanup
+    }
 }
 
 beforeEach(function () {
@@ -133,29 +419,16 @@ beforeEach(function () {
     $this->queueName = uniqueQueue('rabbit-rs-it-chaos');
     declareQueue($this->queueName);
 
-    resetToxiproxy();
-
-    $config = liveConfig($this->queueName);
-    $normalized = ConfigNormalizer::normalize($config);
-
-    $this->pool = new Pool($normalized['native']);
-    $factory = new NativePoolFactory(createPool: fn (): Pool => $this->pool);
-
-    $connector = new RabbitMqConnector($factory, $normalized);
-    $this->queue = $connector->connect([
-        'queue' => $this->queueName,
-        'block_for' => 10,
-    ]);
-    $this->queue->setContainer($this->app);
-    $this->queue->setConnectionName('rabbit-rs-chaos');
+    openChaosPool($this, $this->app);
 });
 
 afterEach(function () {
-    resetToxiproxy();
+    closePoolQuietly(isset($this->pool) ? $this->pool : null);
 
-    if (isset($this->pool) && ! $this->pool->stats()['closed']) {
-        $this->pool->close();
+    if (isset($this->chaosProxy)) {
+        deleteChaosProxy($this->chaosProxy);
     }
+
     deleteQueue($this->queueName);
 });
 
@@ -165,6 +438,8 @@ afterEach(function () {
  * After recovery, the message must be delivered at-least-once.
  */
 it('recovers from TCP reset before publisher confirm', function () {
+    useChaosProxy($this, $this->app);
+
     $this->queue->clear($this->queueName);
 
     // Warmup: publish and consume one message to establish the connection.
@@ -173,23 +448,34 @@ it('recovers from TCP reset before publisher confirm', function () {
     expect($job)->not->toBeNull();
     $job->delete();
 
-    // Inject TCP reset on the proxy.
-    addToxic('reset-before-confirm', 'reset_peer', 'downstream', 1.0, 100);
+    [$reconnectsBefore] = poolCounters($this->pool);
 
-    // Attempt to publish during the outage.
-    $published = false;
-    try {
-        $this->queue->push('stdClass', ['msg' => 'chaos-reset-1']);
-        $published = true;
-    } catch (\Throwable $e) {
-        // Expected: publish may fail during the reset.
+    // Inject TCP reset on this test's own proxy.
+    addToxic($this->chaosProxy, 'reset-before-confirm', 'reset_peer', 'downstream', 1.0, 100);
+
+    // Attempt to publish during the outage. flush() puts the publication on
+    // the wire NOW: a publication still held in the process-side publish
+    // buffer never crosses the proxy, so the reset_peer toxic (which fires on
+    // traffic) would never trigger and the scenario would be vacuous.
+    $published = pushAllowingFailure($this->queue, 'chaos-reset-1');
+    if ($published) {
+        try {
+            $this->pool->flush();
+        } catch (\Throwable) {
+            $published = false; // the reset killed the connection mid-confirm
+        }
     }
 
     // Remove the toxic.
-    removeToxic('reset-before-confirm');
+    removeToxic($this->chaosProxy, 'reset-before-confirm');
 
     // Wait for recovery.
     usleep(3000000); // 3 seconds
+
+    // Non-vacuous: the toxic must have actually bounced the connection.
+    [$reconnectsAfter] = poolCounters($this->pool);
+    $this->assertNotNull($reconnectsAfter, 'pool stats unavailable; cannot verify the toxic fired');
+    $this->assertGreaterThan($reconnectsBefore, $reconnectsAfter, 'the toxic never fired; the scenario would be vacuous');
 
     // If the first attempt failed, retry.
     if (! $published) {
@@ -197,17 +483,7 @@ it('recovers from TCP reset before publisher confirm', function () {
     }
 
     // Consume and verify at-least-once.
-    $received = [];
-    $job = $this->queue->pop();
-    while ($job !== null) {
-        $body = json_decode($job->getRawBody(), true);
-        $received[] = $body['data']['msg'] ?? '';
-        $job->delete();
-        $job = $this->queue->pop();
-    }
-
-    $this->assertContains('chaos-reset-1', $received, 'missing = 0 for tcp-reset-before-confirm');
-    echo "\n[tcp-reset-before-confirm] PASS: missing = 0\n";
+    assertAllDelivered($this, ['chaos-reset-1'], 'tcp-reset-before-confirm');
 });
 
 /*
@@ -216,6 +492,8 @@ it('recovers from TCP reset before publisher confirm', function () {
  * is lost due to a TCP reset. The message must be redelivered.
  */
 it('redelivers after TCP reset between confirm and ACK', function () {
+    useChaosProxy($this, $this->app);
+
     $this->queue->clear($this->queueName);
 
     // Publish a message.
@@ -226,31 +504,19 @@ it('redelivers after TCP reset between confirm and ACK', function () {
     expect($job)->not->toBeNull()
         ->toBeInstanceOf(RabbitMqJob::class);
 
-    // Inject TCP reset.
-    addToxic('reset-before-ack', 'reset_peer', 'downstream', 1.0, 50);
-
-    // Attempt to delete (ACK) — may fail due to the reset.
-    try {
-        $job->delete();
-    } catch (\Throwable $e) {
-        // Expected: ACK may fail during the reset.
-    }
-
-    // Remove the toxic.
-    removeToxic('reset-before-ack');
+    // Inject TCP reset: both proxy legs are cut ~50ms after activation, so
+    // the broker sees the connection die while the message is unacked (and
+    // must requeue it) and the client sees its socket die too. addToxic
+    // fails the test loudly unless the toxics were really applied, and
+    // useChaosProxy guarantees the pool's only path runs through this proxy,
+    // so the scenario cannot pass without a real disruption.
+    fireConnectionKill($this->chaosProxy, 'reset-before-ack', 50);
 
     // Wait for reconnection and redelivery.
     usleep(3000000); // 3 seconds
 
-    // Create a fresh pool to consume the redelivered message.
-    recreatePool($this);
-
-    $job2 = $this->queue->pop();
-    $this->assertNotNull($job2, 'redelivered message after TCP reset before ACK');
-
-    $body = json_decode($job2->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-ack-1');
-    $job2->delete();
+    // The rejoined consumer must receive the redelivered message.
+    consumeDeliveredMessage($this, 'chaos-ack-1', 'at-least-once violation: message never redelivered after TCP reset before ACK');
 
     echo "\n[tcp-reset-after-confirm-before-ack] PASS: missing = 0\n";
 });
@@ -263,8 +529,11 @@ it('redelivers after TCP reset between confirm and ACK', function () {
 it('survives quorum leader shutdown', function () {
     $this->queue->clear($this->queueName);
 
-    // Publish before the leader shutdown.
+    // Publish before the leader shutdown and put it on the wire: a
+    // publication still in the process-side publish buffer would be dropped
+    // by the recreatePool teardown below instead of facing the outage.
     $this->queue->push('stdClass', ['msg' => 'chaos-leader-1']);
+    $this->pool->flush();
 
     // Find and stop the leader node.
     $leader = getQueueLeader($this->queueName);
@@ -274,13 +543,7 @@ it('survives quorum leader shutdown', function () {
     usleep(5000000); // 5 seconds
 
     // Publish after the leader shutdown.
-    $published = false;
-    try {
-        $this->queue->push('stdClass', ['msg' => 'chaos-leader-2']);
-        $published = true;
-    } catch (\Throwable $e) {
-        // May need a retry.
-    }
+    $published = pushAllowingFailure($this->queue, 'chaos-leader-2');
 
     // Restart the stopped node.
     startNode($leader);
@@ -288,23 +551,12 @@ it('survives quorum leader shutdown', function () {
 
     // Retry if needed.
     if (! $published) {
-        recreatePool($this);
+        recreatePool($this, $this->app);
         $this->queue->push('stdClass', ['msg' => 'chaos-leader-2']);
     }
 
     // Consume both messages.
-    $received = [];
-    $job = $this->queue->pop();
-    while ($job !== null) {
-        $body = json_decode($job->getRawBody(), true);
-        $received[] = $body['data']['msg'] ?? '';
-        $job->delete();
-        $job = $this->queue->pop();
-    }
-
-    $this->assertContains('chaos-leader-1', $received, 'missing leader-1');
-    $this->assertContains('chaos-leader-2', $received, 'missing leader-2');
-    echo "\n[quorum-leader-shutdown] PASS: missing = 0\n";
+    assertAllDelivered($this, ['chaos-leader-1', 'chaos-leader-2'], 'quorum-leader-shutdown');
 });
 
 /*
@@ -315,8 +567,11 @@ it('survives quorum leader shutdown', function () {
 it('survives node restart', function () {
     $this->queue->clear($this->queueName);
 
-    // Publish before restart.
+    // Publish before restart and put it on the wire (same reasoning as the
+    // leader-shutdown scenario: recreatePool must not drop a buffered
+    // publication).
     $this->queue->push('stdClass', ['msg' => 'chaos-restart-1']);
+    $this->pool->flush();
 
     // Stop and start rabbitmq-1.
     stopNode(PRIMARY_NODE);
@@ -325,32 +580,15 @@ it('survives node restart', function () {
     usleep(5000000); // 5 seconds
 
     // Publish after restart.
-    $published = false;
-    try {
-        $this->queue->push('stdClass', ['msg' => 'chaos-restart-2']);
-        $published = true;
-    } catch (\Throwable $e) {
-        // May need retry.
-    }
+    $published = pushAllowingFailure($this->queue, 'chaos-restart-2');
 
     if (! $published) {
-        recreatePool($this);
+        recreatePool($this, $this->app);
         $this->queue->push('stdClass', ['msg' => 'chaos-restart-2']);
     }
 
     // Consume both.
-    $received = [];
-    $job = $this->queue->pop();
-    while ($job !== null) {
-        $body = json_decode($job->getRawBody(), true);
-        $received[] = $body['data']['msg'] ?? '';
-        $job->delete();
-        $job = $this->queue->pop();
-    }
-
-    $this->assertContains('chaos-restart-1', $received, 'missing restart-1');
-    $this->assertContains('chaos-restart-2', $received, 'missing restart-2');
-    echo "\n[node-restart] PASS: missing = 0\n";
+    assertAllDelivered($this, ['chaos-restart-1', 'chaos-restart-2'], 'node-restart');
 });
 
 /*
@@ -359,6 +597,8 @@ it('survives node restart', function () {
  * must be redelivered after the partition heals.
  */
 it('redelivers after consumer network partition', function () {
+    useChaosProxy($this, $this->app);
+
     $this->queue->clear($this->queueName);
 
     // Publish a message.
@@ -368,30 +608,17 @@ it('redelivers after consumer network partition', function () {
     $job = $this->queue->pop();
     expect($job)->not->toBeNull();
 
-    // Create a partition by blocking all traffic.
-    addToxic('partition-consumer', 'timeout', 'downstream', 1.0, 0);
+    // Partition the consumer by cutting both proxy legs, so the broker sees
+    // the connection die and requeues the unacked message while the client's
+    // socket dies too. addToxic fails the test loudly unless the toxics were
+    // really applied, and useChaosProxy guarantees the pool's only path runs
+    // through this proxy.
+    fireConnectionKill($this->chaosProxy, 'partition-consumer', 100);
 
-    // Attempt to delete (ACK) — will fail in the partition.
-    try {
-        $job->delete();
-    } catch (\Throwable $e) {
-        // Expected.
-    }
+    usleep(2000000); // 2 seconds in partition aftermath
 
-    usleep(2000000); // 2 seconds in partition
-
-    // Heal the partition.
-    removeToxic('partition-consumer');
-    usleep(3000000); // 3 seconds for recovery
-
-    // Create a fresh pool and consume the redelivered message.
-    recreatePool($this);
-
-    $job2 = $this->queue->pop();
-    $this->assertNotNull($job2, 'redelivered message after partition');
-    $body = json_decode($job2->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-partition-1');
-    $job2->delete();
+    // The rejoined consumer must receive the redelivered message.
+    consumeDeliveredMessage($this, 'chaos-partition-1', 'at-least-once violation: message never redelivered after partition');
 
     echo "\n[consumer-partition] PASS: missing = 0\n";
 });
@@ -410,17 +637,13 @@ it('publishes after channel closed for topology error', function () {
     $job->delete();
 
     // Close and recreate the pool to simulate a channel error.
-    recreatePool($this);
+    recreatePool($this, $this->app);
     $this->queue->clear($this->queueName);
 
     // Publish after the channel recreation.
     $this->queue->push('stdClass', ['msg' => 'chaos-topo-2']);
 
-    $job2 = $this->queue->pop();
-    expect($job2)->not->toBeNull();
-    $body = json_decode($job2->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-topo-2');
-    $job2->delete();
+    consumeDeliveredMessage($this, 'chaos-topo-2', 'message delivered after the channel recreation');
 
     echo "\n[channel-closed-topology-error] PASS: missing = 0\n";
 });
@@ -435,11 +658,7 @@ it('works with delay plugin unavailable', function () {
 
     $this->queue->push('stdClass', ['msg' => 'chaos-delay-1']);
 
-    $job = $this->queue->pop();
-    expect($job)->not->toBeNull();
-    $body = json_decode($job->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-delay-1');
-    $job->delete();
+    consumeDeliveredMessage($this, 'chaos-delay-1', 'the published job is delivered');
 
     echo "\n[delay-plugin-unavailable] PASS: missing = 0\n";
 });
@@ -474,9 +693,7 @@ it('rejects bad credentials and delivers with good credentials', function () {
     } catch (\Throwable $e) {
         $threw = true;
     } finally {
-        if (! $badPool->stats()['closed']) {
-            $badPool->close();
-        }
+        closePoolQuietly($badPool);
     }
 
     expect($threw)->toBeTrue('publish with bad credentials must fail');
@@ -484,11 +701,7 @@ it('rejects bad credentials and delivers with good credentials', function () {
 
     // Verify good credentials still work.
     $this->queue->push('stdClass', ['msg' => 'chaos-creds-2']);
-    $job = $this->queue->pop();
-    expect($job)->not->toBeNull();
-    $body = json_decode($job->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-creds-2');
-    $job->delete();
+    consumeDeliveredMessage($this, 'chaos-creds-2', 'good credentials still deliver');
 
     echo "\n[credentials-rejected] PASS: missing = 0 with good credentials\n";
 });
@@ -514,13 +727,9 @@ it('redelivers after worker SIGTERM with unacked jobs', function () {
     usleep(3000000); // 3 seconds for the broker to redeliver
 
     // Create a fresh pool and consume the redelivered message.
-    recreatePool($this);
+    recreatePool($this, $this->app);
 
-    $job2 = $this->queue->pop();
-    $this->assertNotNull($job2, 'redelivered message after SIGTERM');
-    $body = json_decode($job2->getRawBody(), true);
-    expect($body['data']['msg'])->toBe('chaos-sigterm-1');
-    $job2->delete();
+    consumeDeliveredMessage($this, 'chaos-sigterm-1', 'redelivered message after SIGTERM');
 
     echo "\n[worker-sigterm-unacked] PASS: missing = 0\n";
 });

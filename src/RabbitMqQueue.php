@@ -52,6 +52,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         private readonly int $blockForMilliseconds = 0,
         array $publisherConfig = [],
         private readonly bool $autoSubscribe = false,
+        private readonly bool $hasDeadLetter = false,
     ) {
         $this->dispatchAfterCommit = $dispatchAfterCommit;
         $this->messages = $messages ?? new MessageMapper($publisherConfig);
@@ -60,6 +61,12 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
 
     private function registerDefaultCallbacks(): void
     {
+        // Native callbacks accumulate on a shared pool, so re-registering the
+        // defaults without clearing first would make every event fire once
+        // per queue construction (worker/pool reuse). Clearing keeps the
+        // default registration idempotent: the most recently constructed
+        // queue on a pool owns the default event dispatch.
+        $this->pool->clearEventCallbacks();
         $weak = \WeakReference::create($this);
         $this->pool->onConnectionState(
             static function (string $broker, string $state, int $generation) use ($weak): void {
@@ -84,7 +91,8 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
      * ConnectionStateChanged event through the Laravel event system.
      *
      * Register a custom callback via Pool::onConnectionState() to replace
-     * this default behavior.
+     * this default behavior; native callbacks accumulate, so call
+     * Pool::clearEventCallbacks() first to drop the defaults.
      */
     public function onConnectionState(string $broker, string $state, int $generation): void
     {
@@ -96,7 +104,8 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
      * BackpressureDetected event through the Laravel event system.
      *
      * Register a custom callback via Pool::onBackpressure() to replace
-     * this default behavior.
+     * this default behavior; native callbacks accumulate, so call
+     * Pool::clearEventCallbacks() first to drop the defaults.
      */
     public function onBackpressure(string $broker, int $inFlight, int $capacity): void
     {
@@ -344,9 +353,19 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
                 if (in_array($kind, ['StaleGeneration', 'Transport'], true)) {
                     throw new ConnectionException($error['message'] ?? 'settlement error: ' . $kind);
                 }
-                if (isset($this->container)) {
-                    $this->container->make('log')->warning('rabbit-rs settlement error', $error);
+                if (! isset($this->container)) {
+                    continue;
                 }
+                // A MaxAttempts or InvalidDelay settlement is terminal poison
+                // policy (attempts above the cap, or a release delay the
+                // compiled delay strategy refuses): with no dead-letter
+                // exchange it is an explicit, documented loss, so it is logged
+                // at error level with the core's error context.
+                if (in_array($kind, ['MaxAttempts', 'InvalidDelay'], true)) {
+                    $this->container->make('log')->error('rabbit-rs: poison delivery settled', $error);
+                    continue;
+                }
+                $this->container->make('log')->warning('rabbit-rs settlement error', $error);
             }
         }
     }
@@ -377,19 +396,67 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             $consumer = $this->consumers[$profile] ??= $this->pool->consumer($profile);
             $delivery = $consumer->next($this->blockForMilliseconds);
         } catch (ConnectionException $exception) {
+            // Connection-level consumer errors (SourceReplaced, StaleGeneration,
+            // Transport) mean the handle is retired or stale: evict it so the
+            // next pop re-fetches a fresh consumer from the pool instead of
+            // replaying the retired handle's one-shot error forever.
+            unset($this->consumers[$profile]);
             throw $exception;
         } catch (NativeException $exception) {
+            // Closed surfaces as the base native exception: the handle is
+            // terminal, the next pop must re-fetch.
+            unset($this->consumers[$profile]);
             throw QueueException::fromNative($exception);
         }
         if ($delivery === null) {
             return null;
         }
         $metadata = $delivery->metadata();
+        $queueName = $this->workerProfiles->queue($profile, $metadata['subscription'] ?? null);
 
-        return $this->marshalJob(
-            $delivery,
-            $this->workerProfiles->queue($profile, $metadata['subscription'] ?? null),
-        );
+        // Only job-construction failures (unmarshable payload, missing
+        // message id) are settled here; routing errors above must keep
+        // surfacing to the caller.
+        try {
+            return $this->marshalJob($delivery, $queueName);
+        } catch (InvalidArgumentException $exception) {
+            // A delivery that cannot be marshalled into a job would otherwise
+            // be redelivered forever with the prefetch slot burned. Settle it
+            // terminally per the documented poison policy instead of leaving
+            // it pending.
+            $this->settleUnmarshable($delivery, $metadata, $exception);
+
+            return null;
+        }
+    }
+
+    /**
+     * Settles an unmarshable delivery terminally: rejected with
+     * requeue=false toward the dead-letter exchange when one is configured,
+     * otherwise explicitly acknowledged. The action is logged loudly on the
+     * Log facade in both cases.
+     */
+    private function settleUnmarshable(
+        Delivery $delivery,
+        array $metadata,
+        InvalidArgumentException $exception,
+    ): void {
+        if ($this->hasDeadLetter) {
+            $delivery->reject(false);
+            $action = 'rejected with requeue=false toward the dead-letter exchange';
+        } else {
+            $delivery->ack();
+            $action = 'acknowledged and dropped (no dead-letter exchange configured)';
+        }
+
+        if (isset($this->container)) {
+            $this->container->make('log')->error('rabbit-rs: poison delivery settled', [
+                'message_id' => $metadata['message_id'] ?? null,
+                'attempts' => $metadata['attempts'] ?? null,
+                'reason' => $exception->getMessage(),
+                'action' => $action,
+            ]);
+        }
     }
 
     /**

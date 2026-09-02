@@ -57,11 +57,9 @@ describe('native normalization', function (): void {
                 ],
                 'tls' => [
                     'enabled' => false,
-                    'server_name' => null,
                     'ca_cert' => null,
                     'client_cert' => null,
                     'client_key' => null,
-                    'verify' => 'peer',
                 ],
                 'heartbeat' => 30,
             ]],
@@ -88,7 +86,6 @@ describe('native normalization', function (): void {
                 'buckets' => [1, 5, 30, 120],
                 'max_buckets' => 8,
                 'queue_expiry_margin' => 60,
-                'detection_timeout' => 5,
             ],
             'dead_letter' => null,
             'delivery_limit' => null,
@@ -100,6 +97,7 @@ describe('native normalization', function (): void {
             ],
             'consumer' => [
                 'wait_timeout' => 30000,
+                'max_attempts' => 20,
             ],
             'queue_type' => 'quorum',
             'queue_durable' => true,
@@ -178,40 +176,42 @@ describe('publisher section', function (): void {
 });
 
 describe('consumer section', function (): void {
-    it('maps consumer wait_timeout to the native config', function (): void {
+    it('maps consumer :key to the native config', function (string $key, int $value): void {
         $config = configValidConfig();
-        $config['consumers'] = ['wait_timeout' => 5000];
+        $config['consumers'] = [$key => $value];
 
         $normalized = ConfigNormalizer::normalize($config);
 
-        expect(5000)->toBe($normalized['native']['consumer']['wait_timeout']);
-    });
+        expect($value)->toBe($normalized['native']['consumer'][$key]);
+    })->with([
+        'wait_timeout' => ['wait_timeout', 5000],
+        'max_attempts' => ['max_attempts', 25],
+    ]);
 
-    it('defaults the consumer wait_timeout to thirty seconds', function (): void {
+    it('defaults the consumer :key', function (string $key, int $expected): void {
         $normalized = ConfigNormalizer::normalize(configValidConfig());
 
-        expect(30000)->toBe($normalized['native']['consumer']['wait_timeout']);
-    });
+        expect($expected)->toBe($normalized['native']['consumer'][$key]);
+    })->with([
+        'wait_timeout' => ['wait_timeout', 30000],
+        'max_attempts' => ['max_attempts', 20],
+    ]);
 
-    it('rejects a zero consumer wait_timeout', function (): void {
+    it('rejects an invalid consumer :key', function (string $key, int|string $value): void {
         $config = configValidConfig();
-        $config['consumers'] = ['wait_timeout' => 0];
+        $config['consumers'] = [$key => $value];
 
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('consumers.wait_timeout');
+        $this->expectExceptionMessage("consumers.{$key}");
 
         ConfigNormalizer::normalize($config);
-    });
-
-    it('rejects a consumer wait_timeout beyond twenty-four hours', function (): void {
-        $config = configValidConfig();
-        $config['consumers'] = ['wait_timeout' => 86_400_001];
-
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('consumers.wait_timeout');
-
-        ConfigNormalizer::normalize($config);
-    });
+    })->with([
+        'wait_timeout zero' => ['wait_timeout', 0],
+        'wait_timeout beyond twenty-four hours' => ['wait_timeout', 86_400_001],
+        'max_attempts zero' => ['max_attempts', 0],
+        'max_attempts non-integer' => ['max_attempts', 'many'],
+        'max_attempts negative' => ['max_attempts', -1],
+    ]);
 });
 
 describe('IPv6', function (): void {
@@ -474,45 +474,67 @@ describe('TLS', function (): void {
         $config = configValidConfig();
         $config['brokers']['default']['tls'] = [
             'enabled' => true,
-            'server_name' => 'broker.internal',
             'ca_cert' => '/etc/ssl/certs/ca.pem',
             'client_cert' => '/etc/ssl/client/cert.pem',
             'client_key' => '/etc/ssl/client/key.pem',
-            'verify' => 'peer',
         ];
 
         $normalized = ConfigNormalizer::normalize($config);
 
         expect([
             'enabled' => true,
-            'server_name' => 'broker.internal',
             'ca_cert' => '/etc/ssl/certs/ca.pem',
             'client_cert' => '/etc/ssl/client/cert.pem',
             'client_key' => '/etc/ssl/client/key.pem',
-            'verify' => 'peer',
         ])->toBe($normalized['native']['brokers'][0]['tls']);
     });
+});
 
-    it('defaults TLS verify to peer', function (): void {
+describe('env-style booleans', function (): void {
+    it('accepts env-string booleans as Laravel env() returns them', function (string $value, bool $expected): void {
         $config = configValidConfig();
-        $config['brokers']['default']['tls'] = ['enabled' => true];
+        $config['best_effort'] = $value;
 
         $normalized = ConfigNormalizer::normalize($config);
 
-        expect('peer')->toBe($normalized['native']['brokers'][0]['tls']['verify']);
+        expect($normalized['best_effort'])->toBe($expected);
+    })->with([
+        '"1"' => ['1', true],
+        '"0"' => ['0', false],
+        '"true"' => ['true', true],
+        '"false"' => ['false', false],
+        '"on"' => ['on', true],
+        '"off"' => ['off', false],
+        '""' => ['', false],
+    ]);
+
+    it('accepts env-string booleans for publisher and tls flags', function (): void {
+        $config = configValidConfig();
+        $config['publisher']['confirms'] = '0';
+        $config['publisher']['mandatory'] = '1';
+        $config['brokers']['default']['tls']['enabled'] = 'true';
+
+        $normalized = ConfigNormalizer::normalize($config);
+
+        expect($normalized['publisher']['confirms'])->toBeFalse()
+            ->and($normalized['publisher']['mandatory'])->toBeTrue()
+            ->and($normalized['native']['brokers'][0]['tls']['enabled'])->toBeTrue();
     });
 
-    it('rejects an invalid TLS verify mode', function (): void {
+    it('rejects junk env-string booleans with the config path', function (): void {
         $config = configValidConfig();
-        $config['brokers']['default']['tls'] = [
-            'enabled' => true,
-            'verify' => 'custom',
-        ];
+        $config['best_effort'] = 'maybe';
 
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('brokers.default.tls.verify');
+        expect(fn (): array => ConfigNormalizer::normalize($config))
+            ->toThrow(InvalidArgumentException::class, 'best_effort');
+    });
 
-        ConfigNormalizer::normalize($config);
+    it('still rejects non-string non-boolean values', function (): void {
+        $config = configValidConfig();
+        $config['best_effort'] = 1;
+
+        expect(fn (): array => ConfigNormalizer::normalize($config))
+            ->toThrow(InvalidArgumentException::class, 'best_effort');
     });
 });
 
@@ -533,11 +555,9 @@ function configValidConfig(): array
                 ],
                 'tls' => [
                     'enabled' => false,
-                    'server_name' => null,
                     'ca_cert' => null,
                     'client_cert' => null,
                     'client_key' => null,
-                    'verify' => 'peer',
                 ],
                 'heartbeat' => 30,
             ],

@@ -65,8 +65,8 @@ return [
     | credentials: Plain username/password. Never logged or exposed in Debug.
     |
     | tls:         TLS settings. Set enabled=true for amqps://. The ca_cert
-    |              is required when verify=peer. client_cert and client_key
-    |              enable mTLS. server_name sets the SNI expectation.
+    |              is required for server certificate verification. client_cert
+    |              and client_key enable mTLS.
     |
     | heartbeat:   AMQP heartbeat in seconds. If no data is exchanged for
     |              2× this interval, the connection is considered dead and
@@ -84,11 +84,9 @@ return [
             ],
             'tls' => [
                 'enabled' => (bool) env('RABBIT_RS_TLS', false),
-                'server_name' => env('RABBIT_RS_TLS_SERVER_NAME'),
                 'ca_cert' => env('RABBIT_RS_TLS_CA_CERT'),
                 'client_cert' => env('RABBIT_RS_TLS_CLIENT_CERT'),
                 'client_key' => env('RABBIT_RS_TLS_CLIENT_KEY'),
-                'verify' => env('RABBIT_RS_TLS_VERIFY', 'peer'),
             ],
             'heartbeat' => (int) env('RABBIT_RS_HEARTBEAT', 30),
         ],
@@ -302,10 +300,20 @@ return [
     |               against an unreachable broker — on expiry the acquisition
     |               fails with a connection error that can be retried.
     |
+    | max_attempts: Inclusive cap on resolved delivery attempts per message.
+    |               A delivery whose attempt count exceeds this value is
+    |               settled terminally instead of being dispatched: it is
+    |               rejected toward the dead-letter exchange when
+    |               topology.dead_letter is configured, otherwise explicitly
+    |               acknowledged and logged. Keep it at or above the --tries
+    |               value used by your workers so Laravel can fail poison
+    |               jobs itself before the native cap settles them.
+    |
     */
 
     'consumers' => [
         'wait_timeout' => (int) env('RABBIT_RS_CONSUMER_WAIT_TIMEOUT', 30000),
+        'max_attempts' => (int) env('RABBIT_RS_MAX_ATTEMPTS', 20),
     ],
 
     /*
@@ -338,9 +346,6 @@ return [
     |                     they survive brief broker restarts without expiring
     |                     mid-delay.
     |
-    | detection_timeout:  Seconds to wait for the plugin detection probe
-    |                     before falling back to TTL mode in "auto".
-    |
     */
 
     'delay' => [
@@ -348,7 +353,6 @@ return [
         'buckets' => array_map('intval', array_filter(array_map('trim', explode(',', env('RABBIT_RS_DELAY_BUCKETS', '1,5,30,120'))))),
         'max_buckets' => (int) env('RABBIT_RS_DELAY_MAX_BUCKETS', 8),
         'queue_expiry_margin' => (int) env('RABBIT_RS_DELAY_QUEUE_EXPIRY_MARGIN', 60),
-        'detection_timeout' => (int) env('RABBIT_RS_DELAY_DETECTION_TIMEOUT', 5),
     ],
 
     /*

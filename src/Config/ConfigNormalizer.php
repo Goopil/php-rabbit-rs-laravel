@@ -11,6 +11,7 @@ final class ConfigNormalizer
     private const DEFAULT_AMQP_PORT = 5672;
     private const DEFAULT_CONSUMER_WAIT_TIMEOUT_MS = 30_000;
     private const MAX_CONSUMER_WAIT_TIMEOUT_MS = 86_400_000;
+    private const DEFAULT_MAX_ATTEMPTS = 20;
     private const MSG_MUST_BE_ARRAY = 'must be an array';
     private const MSG_MUST_BE_NULL_OR_STRING = 'must be null or a string';
     private const MSG_NO_ACK = '.no_ack';
@@ -162,7 +163,7 @@ final class ConfigNormalizer
     }
 
     /**
-     * @return array{enabled: bool, server_name: ?string, ca_cert: ?string, client_cert: ?string, client_key: ?string, verify: string}
+     * @return array{enabled: bool, ca_cert: ?string, client_cert: ?string, client_key: ?string}
      */
     private static function tls(mixed $tls, string $path): array
     {
@@ -170,15 +171,7 @@ final class ConfigNormalizer
             self::invalid($path, self::MSG_MUST_BE_ARRAY);
         }
 
-        $enabled = $tls['enabled'] ?? false;
-        if (! is_bool($enabled)) {
-            self::invalid($path.'.enabled', 'must be a boolean');
-        }
-
-        $serverName = $tls['server_name'] ?? null;
-        if ($serverName !== null && (! is_string($serverName) || $serverName === '')) {
-            self::invalid($path.'.server_name', 'must be null or a non-empty string');
-        }
+        $enabled = self::boolean($tls['enabled'] ?? false, $path.'.enabled');
 
         $caCert = $tls['ca_cert'] ?? null;
         if ($caCert !== null && ! is_string($caCert)) {
@@ -195,18 +188,11 @@ final class ConfigNormalizer
             self::invalid($path.'.client_key', self::MSG_MUST_BE_NULL_OR_STRING);
         }
 
-        $verify = $tls['verify'] ?? 'peer';
-        if (! is_string($verify) || ! in_array($verify, ['peer', 'none'], true)) {
-            self::invalid($path.'.verify', 'must be peer or none');
-        }
-
         return [
             'enabled' => $enabled,
-            'server_name' => $serverName,
             'ca_cert' => $caCert,
             'client_cert' => $clientCert,
             'client_key' => $clientKey,
-            'verify' => $verify,
         ];
     }
 
@@ -485,11 +471,16 @@ final class ConfigNormalizer
             );
         }
 
-        return ['wait_timeout' => $waitTimeout];
+        $maxAttempts = $consumers['max_attempts'] ?? self::DEFAULT_MAX_ATTEMPTS;
+        if (! is_int($maxAttempts) || $maxAttempts < 1) {
+            self::invalid('consumers.max_attempts', 'must be a positive integer');
+        }
+
+        return ['wait_timeout' => $waitTimeout, 'max_attempts' => $maxAttempts];
     }
 
     /**
-     * @return array{mode: string, buckets: list<int>, max_buckets: int, queue_expiry_margin: int, detection_timeout: int}
+     * @return array{mode: string, buckets: list<int>, max_buckets: int, queue_expiry_margin: int}
      */
     private static function delay(mixed $delay): array
     {
@@ -523,10 +514,6 @@ final class ConfigNormalizer
             'queue_expiry_margin' => self::positiveInt(
                 $delay['queue_expiry_margin'] ?? 60,
                 'delay.queue_expiry_margin',
-            ),
-            'detection_timeout' => self::positiveInt(
-                $delay['detection_timeout'] ?? 5,
-                'delay.detection_timeout',
             ),
         ];
     }
@@ -607,11 +594,20 @@ final class ConfigNormalizer
 
     private static function boolean(mixed $value, string $path): bool
     {
-        if (! is_bool($value)) {
-            self::invalid($path, 'must be a boolean');
+        if (is_bool($value)) {
+            return $value;
         }
 
-        return $value;
+        // Laravel env() returns strings for .env flags (e.g. '1', 'true'),
+        // so accept those forms and reject anything else strictly.
+        if (is_string($value)) {
+            $normalized = filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+            if ($normalized !== null) {
+                return $normalized;
+            }
+        }
+
+        self::invalid($path, 'must be a boolean or an env-style boolean string (e.g. "1", "true")');
     }
 
     private static function positiveInt(mixed $value, string $path, ?int $max = null): int

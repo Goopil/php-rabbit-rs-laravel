@@ -165,15 +165,13 @@ Each broker is a named connection pool. A vhost owns a distinct AMQP connection 
 ```php
 'tls' => [
     'enabled' => (bool) env('RABBIT_RS_TLS', false),
-    'server_name' => env('RABBIT_RS_TLS_SERVER_NAME'),
     'ca_cert' => env('RABBIT_RS_TLS_CA_CERT'),
     'client_cert' => env('RABBIT_RS_TLS_CLIENT_CERT'),
     'client_key' => env('RABBIT_RS_TLS_CLIENT_KEY'),
-    'verify' => env('RABBIT_RS_TLS_VERIFY', 'peer'),
 ],
 ```
 
-Set `enabled=true` for `amqps://`. The `ca_cert` is required when `verify=peer`. `client_cert` and `client_key` enable mutual TLS. `server_name` sets the SNI expectation.
+Set `enabled=true` for `amqps://`. The `ca_cert` enables server certificate verification. `client_cert` and `client_key` enable mutual TLS.
 
 ### Routes
 
@@ -391,7 +389,7 @@ php artisan rabbit-rs:work --queue=default --workers=4 --max-restarts=3
 php artisan rabbit-rs:work --connection=rabbit-rs --queue=high-priority
 ```
 
-The supervisor spawns child `queue:work` processes, passes the worker index via `RABBIT_RS_WORKER`, and restarts them on exit with exponential backoff.
+The supervisor spawns child `queue:work` processes, passes the worker index via `RABBIT_RS_WORKER`, and restarts them on exit: a clean exit (0, e.g. `--max-jobs` recycling) restarts immediately without consuming the restart budget, while a non-zero exit is treated as a crash and restarted with exponential backoff up to `--max-restarts` times.
 
 | Option | Description | Default |
 | ------ | ----------- | ------- |
@@ -419,6 +417,7 @@ When Laravel Octane is detected, the driver automatically:
 
 - Closes cached consumers after each request (prevents channel leaks)
 - Flushes all pools on worker reload
+- Re-normalizes the `rabbit-rs` config on worker reload — broker or credential rotation via env variables takes effect for connections resolved after the reload
 - Stops all pools on worker shutdown
 
 No configuration needed — the lifecycle hooks are registered by the service provider.

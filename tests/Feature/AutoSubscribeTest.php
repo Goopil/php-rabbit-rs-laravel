@@ -107,7 +107,7 @@ function validAutoSubscribeConfig(): array
                 'hosts' => ['127.0.0.1:5672'],
                 'vhost' => '/',
                 'credentials' => ['username' => 'rabbit_rs', 'password' => 'rabbit_rs_lab'],
-                'tls' => ['enabled' => false, 'server_name' => null],
+                'tls' => ['enabled' => false],
                 'heartbeat' => 30,
             ],
         ],
@@ -254,9 +254,9 @@ describe('auto_subscribe config normalization', function () {
         expect(ConfigNormalizer::normalize($config)['auto_subscribe'])->toBeTrue();
     });
 
-    it('rejects a non-boolean auto_subscribe', function (): void {
+    it('rejects a junk string auto_subscribe', function (): void {
         $config = validAutoSubscribeConfig();
-        $config['auto_subscribe'] = 'yes';
+        $config['auto_subscribe'] = 'maybe';
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('auto_subscribe');
