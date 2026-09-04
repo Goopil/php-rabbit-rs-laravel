@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 use Goopil\RabbitRs\ConnectionException;
-use Goopil\RabbitRs\Laravel\Config\ConfigNormalizer;
+use Goopil\RabbitRs\Laravel\Config\ConnectionCompiler;
 use Goopil\RabbitRs\Laravel\Connectors\RabbitMqConnector;
 use Goopil\RabbitRs\Laravel\Exceptions\QueueException;
 use Goopil\RabbitRs\Laravel\Jobs\RabbitMqJob;
@@ -251,6 +251,38 @@ function startNode(string $node): void
         }
         usleep(2000000); // 2 seconds
     }
+
+    restoreConfigurePermission();
+}
+
+/**
+ * Re-grants the rabbit-rs configure permission, polling until the widened
+ * pattern verifiably landed on the management API. The lab re-imports
+ * definitions.json on every node boot, which resets the permission to the
+ * stored narrow pattern, and the driver's recovery re-declares
+ * rabbit-rs.delayed (issue #97) — so every recovery generation after the
+ * restart fails topology reconciliation until the grant is restored. A bare
+ * PUT right after the rabbitmq-diagnostics ping silently no-ops while the
+ * management listener is still down.
+ */
+function restoreConfigurePermission(): void
+{
+    $deadline = microtime(true) + 90;
+    do {
+        grantRabbitRsConfigure();
+        $stored = json_decode(
+            managementRequest('GET', 'http://localhost:15672/api/permissions/'.rawurlencode('/orders-eu').'/rabbit_rs'),
+            true,
+        );
+        if (($stored['configure'] ?? null) === '^(amq\\.|rabbit-rs-it-|rabbit-rs\\.)') {
+            return;
+        }
+        usleep(1000000);
+    } while (microtime(true) < $deadline);
+
+    \PHPUnit\Framework\Assert::fail(
+        'the lab management API never restored the rabbit-rs configure permission after the node restart',
+    );
 }
 
 function nodeToContainer(string $node): string
@@ -329,14 +361,28 @@ function consumeDeliveredMessage($test, string $expectedMessage, string $descrip
 }
 
 /**
- * Drains every currently available job and returns their payload messages,
- * tolerating retired-consumer errors the same way popDelivery() does.
+ * Drains deliveries until every expected payload message has been received
+ * at least once, or the queue has stayed quiet past a plausible window
+ * (nothing more can arrive without a new publish). Tolerates retired-consumer
+ * errors the same way popDelivery() does. Duplicates are kept and every
+ * job's broker attempts counter recorded, so callers can count duplicates
+ * and prove redeliveries.
+ *
+ * @param array<string> $expected payload messages that must arrive
+ * @return array<string, array{count: int, attempts: int}> received count and
+ *         maximum broker attempts observed per payload message
  */
-function drainDeliveredMessages($test): array
+function drainUntilAllReceived($test, array $expected, int $quietMs = 3000): array
 {
     $received = [];
-    $deadline = microtime(true) + 30;
-    while (microtime(true) < $deadline) {
+    $pending = array_fill_keys($expected, true);
+    $deadline = microtime(true) + 60;
+    $lastReceipt = microtime(true);
+
+    while (microtime(true) < $deadline && $pending !== []) {
+        if ((microtime(true) - $lastReceipt) * 1000 > $quietMs) {
+            break; // quiet past the plausible window: nothing more will arrive
+        }
         try {
             $job = $test->queue->pop();
         } catch (QueueException | ConnectionException) {
@@ -344,11 +390,16 @@ function drainDeliveredMessages($test): array
             continue;
         }
         if ($job === null) {
-            break;
+            usleep(50000);
+            continue;
         }
         $body = json_decode($job->getRawBody(), true);
-        $received[] = $body['data']['msg'] ?? '';
+        $msg = $body['data']['msg'] ?? '';
+        $received[$msg]['count'] = ($received[$msg]['count'] ?? 0) + 1;
+        $received[$msg]['attempts'] = max($received[$msg]['attempts'] ?? 0, $job->attempts());
+        unset($pending[$msg]);
         $job->delete();
+        $lastReceipt = microtime(true);
     }
 
     return $received;
@@ -358,15 +409,57 @@ function drainDeliveredMessages($test): array
  * Publishes tolerating the connection failures an active toxic produces.
  * Returns whether the publish went through; callers retry after recovery.
  */
-function pushAllowingFailure($queue, string $msg): bool
+function pushAllowingFailure($queue, string $msg, ?string &$lastError = null): bool
 {
     try {
         $queue->push('stdClass', ['msg' => $msg]);
 
         return true;
-    } catch (\Throwable) {
+    } catch (\Throwable $e) {
+        $lastError = $e->getMessage();
+
         return false; // publish may fail during the outage
     }
+}
+
+/**
+ * Makes sure a message is confirmed on the wire after a disruption: the
+ * publish may have failed with the dead connection, and a publication that
+ * stayed in the process publish buffer only leaves on the next publish's
+ * flush trigger or an explicit flush — a drain would never see it. Retries
+ * with a fresh pool while the connection is still re-establishing. A
+ * duplicate is acceptable; the delivery contract is at-least-once.
+ */
+function putOnWire($test, $app, string $msg): void
+{
+    $onWire = false;
+    $lastError = '';
+    // 90 s: a lab node that reboots right after a heavy run (long soak,
+    // benchmark) can take tens of seconds past the ping to serve AMQP
+    // again; the other boot budgets here (ping wait, permission restore)
+    // already tolerate this, and the deadline only bounds how long the
+    // message may take to LAND — the 0-loss assertion below stays strict.
+    $deadline = microtime(true) + 90;
+    while (microtime(true) < $deadline && ! $onWire) {
+        $onWire = pushAllowingFailure($test->queue, $msg, $lastError);
+        if ($onWire) {
+            try {
+                $test->pool->flush();
+            } catch (\Throwable $e) {
+                $lastError = 'flush: '.$e->getMessage();
+                $onWire = false; // pool still recovering
+            }
+        }
+        if (! $onWire) {
+            recreatePool($test, $app);
+            usleep(500000);
+        }
+    }
+
+    $test->assertTrue(
+        $onWire,
+        $msg.' never reached the broker after the disruption'.($lastError === '' ? '' : '; last error: '.$lastError),
+    );
 }
 
 /**
@@ -381,15 +474,26 @@ function fireConnectionKill(string $proxy, string $name, int $timeoutMs): void
 }
 
 /**
- * Drains the queue and asserts every message arrived (at-least-once).
+ * Drains the queue and asserts every message arrived (at-least-once):
+ * each published message must be received at least once (0 loss), and
+ * duplicates are counted (permitted, never silent) from the per-message
+ * receive counts. Returns the receive counts keyed by payload message.
+ *
+ * @param array<string> $messages published payload messages
+ * @return array<string, int> received count per payload message
  */
-function assertAllDelivered($test, array $messages, string $label): void
+function assertAllDelivered($test, array $messages, string $label): array
 {
-    $received = drainDeliveredMessages($test);
+    $received = drainUntilAllReceived($test, $messages);
+    $counts = array_map(static fn (array $entry): int => $entry['count'], $received);
+    $total = array_sum($counts);
     foreach ($messages as $msg) {
-        $test->assertContains($msg, $received, 'missing '.$msg);
+        $test->assertArrayHasKey($msg, $counts, 'missing '.$msg.' (0-loss violation)');
     }
-    echo "\n[".$label.'] PASS: missing = 0'."\n";
+    $duplicates = $total - count($counts);
+    echo "\n[".$label.'] PASS: missing = 0, received = '.$total.', duplicates = '.$duplicates."\n";
+
+    return $received;
 }
 
 /**
@@ -415,6 +519,11 @@ beforeEach(function () {
     if (! extension_loaded('rabbit_rs')) {
         skip('ext-rabbit_rs is required for chaos tests');
     }
+
+    // Declare-mode pools with the default auto delay strategy now provision
+    // the rabbit-rs.delayed exchange themselves (issue #97); the lab's stored
+    // configure permission only allows amq.* and rabbit-rs-it-* names.
+    grantRabbitRsConfigure();
 
     $this->queueName = uniqueQueue('rabbit-rs-it-chaos');
     declareQueue($this->queueName);
@@ -543,17 +652,17 @@ it('survives quorum leader shutdown', function () {
     usleep(5000000); // 5 seconds
 
     // Publish after the leader shutdown.
-    $published = pushAllowingFailure($this->queue, 'chaos-leader-2');
+    pushAllowingFailure($this->queue, 'chaos-leader-2');
 
     // Restart the stopped node.
     startNode($leader);
     usleep(5000000); // 5 seconds
 
-    // Retry if needed.
-    if (! $published) {
-        recreatePool($this, $this->app);
-        $this->queue->push('stdClass', ['msg' => 'chaos-leader-2']);
-    }
+    // The outage push may have failed or still sit in the process publish
+    // buffer (a buffered publication only leaves on the next publish's
+    // flush trigger or an explicit flush). Make sure chaos-leader-2 is on
+    // the wire before draining: duplicates are fine — at-least-once.
+    putOnWire($this, $this->app, 'chaos-leader-2');
 
     // Consume both messages.
     assertAllDelivered($this, ['chaos-leader-1', 'chaos-leader-2'], 'quorum-leader-shutdown');
@@ -579,13 +688,10 @@ it('survives node restart', function () {
     startNode(PRIMARY_NODE);
     usleep(5000000); // 5 seconds
 
-    // Publish after restart.
-    $published = pushAllowingFailure($this->queue, 'chaos-restart-2');
-
-    if (! $published) {
-        recreatePool($this, $this->app);
-        $this->queue->push('stdClass', ['msg' => 'chaos-restart-2']);
-    }
+    // Publish after restart: the pool may still be re-establishing, and a
+    // buffered publication only leaves on the next publish's flush trigger
+    // or an explicit flush. Make sure chaos-restart-2 is on the wire.
+    putOnWire($this, $this->app, 'chaos-restart-2');
 
     // Consume both.
     assertAllDelivered($this, ['chaos-restart-1', 'chaos-restart-2'], 'node-restart');
@@ -671,24 +777,22 @@ it('works with delay plugin unavailable', function () {
 it('rejects bad credentials and delivers with good credentials', function () {
     $this->queue->clear($this->queueName);
 
-    // Build a config with bad credentials.
+    // Build a connection config with bad credentials, compiled to its own
+    // pool under a dedicated connection name.
     $config = liveConfig($this->queueName);
-    $config['brokers']['default']['credentials'] = [
-        'username' => 'rabbit_rs',
-        'password' => 'wrong_password',
-    ];
-    $normalized = ConfigNormalizer::normalize($config);
+    $config['password'] = 'wrong_password';
+    $compiled = ConnectionCompiler::compile('rabbit-rs-bad-creds', $config);
 
-    $badPool = new Pool($normalized['native']);
+    $badPool = new Pool($compiled['native']);
     $badFactory = new NativePoolFactory(createPool: fn (): Pool => $badPool);
-    $badConnector = new RabbitMqConnector($badFactory, $normalized);
+    $badConnector = new RabbitMqConnector($badFactory, $config);
+
+    $connectConfig = ['queue' => $this->queueName, 'block_for' => 3];
+    $this->app['config']->set('queue.connections.rabbit-rs-bad-creds', $connectConfig);
 
     $threw = false;
     try {
-        $badQueue = $badConnector->connect([
-            'queue' => $this->queueName,
-            'block_for' => 3,
-        ]);
+        $badQueue = $badConnector->connect($connectConfig);
         $badQueue->push('stdClass', ['msg' => 'should-fail']);
     } catch (\Throwable $e) {
         $threw = true;
@@ -732,4 +836,92 @@ it('redelivers after worker SIGTERM with unacked jobs', function () {
     consumeDeliveredMessage($this, 'chaos-sigterm-1', 'redelivered message after SIGTERM');
 
     echo "\n[worker-sigterm-unacked] PASS: missing = 0\n";
+});
+
+/*
+ * Scenario: Connection killed mid-consume (Round I #126 DoD).
+ * Several messages sit unacked in flight when the connection dies.
+ * Recovery must be fully automatic, the pre-kill ACK handles must be
+ * rejected by the core (their acks can only land on the dead generation —
+ * a redelivery replaces the lost ack), and every published message must be
+ * consumed and acked afterwards: 0 loss, duplicates countable.
+ */
+it('recovers when killed mid-consume, rejects stale acks, and redelivers unacked work', function () {
+    useChaosProxy($this, $this->app);
+
+    $this->queue->clear($this->queueName);
+
+    // Publish six messages on the wire before touching the consumer.
+    $published = [];
+    for ($i = 1; $i <= 6; $i++) {
+        $msg = 'chaos-midconsume-'.$i;
+        $published[] = $msg;
+        $this->queue->push('stdClass', ['msg' => $msg]);
+    }
+    $this->pool->flush();
+
+    // Consume the first three but do NOT ack: unacked in-flight work.
+    $staleJobs = [];
+    for ($i = 0; $i < 3; $i++) {
+        $job = popDelivery($this);
+        $this->assertNotNull($job, 'warm pop '.$i.' produced no delivery');
+        $staleJobs[] = $job;
+    }
+    $unackedMsgs = array_map(
+        static fn (object $job): string => json_decode($job->getRawBody(), true)['data']['msg'] ?? '',
+        $staleJobs,
+    );
+
+    [$reconnectsBefore] = poolCounters($this->pool);
+
+    // Kill the connection mid-consume: both proxy legs are cut ~50ms after
+    // activation, so the broker sees the consumer vanish with unacked
+    // deliveries (and must requeue them) while the client's socket dies too.
+    fireConnectionKill($this->chaosProxy, 'kill-mid-consume', 50);
+
+    // Wait for automatic recovery.
+    usleep(3000000); // 3 seconds
+
+    // Generation-aware ACK: the pre-kill handles hold tokens for the dead
+    // generation. Their acks can only land on the dead channel — the core
+    // rejects them (throw at the call, recorded settlement error, or a
+    // dropped command on the retired actor). The binding proof is the
+    // broker's: a rejected stale ack never consumes the broker copy, so
+    // every unacked message must come back as a redelivery below.
+    $staleAckThrew = 0;
+    foreach ($staleJobs as $job) {
+        try {
+            $job->delete();
+        } catch (\Throwable) {
+            $staleAckThrew++;
+        }
+    }
+
+    // Drain with the SAME pool (no recreatePool): auto-recovery must resume
+    // the consumer without manual intervention. The unacked messages come
+    // back as broker redeliveries (attempts >= 2), the never-delivered ones
+    // arrive; all six are acked here. 0 loss, duplicates counted.
+    $received = assertAllDelivered($this, $published, 'kill-mid-consume');
+
+    // Non-vacuous + auto-recovery: the toxic really bounced the connection
+    // and the same pool re-established it (reconnects count successes).
+    [$reconnectsAfter] = poolCounters($this->pool);
+    $this->assertNotNull($reconnectsAfter, 'pool stats unavailable; cannot verify recovery');
+    $this->assertGreaterThan(
+        $reconnectsBefore,
+        $reconnectsAfter,
+        'the connection was never re-established on the same pool; the scenario would be vacuous',
+    );
+    echo "\n[kill-mid-consume] stale acks thrown at call = {$staleAckThrew}/3, reconnects = {$reconnectsAfter}\n";
+
+    // Redelivery proof: every unacked message reappears with a broker
+    // attempts counter >= 2 — a redelivery replaced the lost ack, never a
+    // silent drop.
+    foreach ($unackedMsgs as $msg) {
+        $this->assertGreaterThanOrEqual(
+            2,
+            $received[$msg]['attempts'] ?? 0,
+            $msg.' was unacked in flight but did not come back as a broker redelivery',
+        );
+    }
 });

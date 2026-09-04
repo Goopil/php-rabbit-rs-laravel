@@ -9,6 +9,11 @@ beforeEach(function () {
         skip('ext-rabbit_rs is required for integration tests');
     }
 
+    // Declare-mode pools with the default auto delay strategy now provision
+    // the rabbit-rs.delayed exchange themselves (issue #97); the lab's stored
+    // configure permission only allows amq.* and rabbit-rs-it-* names.
+    grantRabbitRsConfigure();
+
     $this->queueName = uniqueQueue();
     declareQueue($this->queueName);
 
@@ -117,7 +122,8 @@ it('keeps the queue empty when clear purges buffered publications', function () 
     $this->queue->push('stdClass', ['clear' => 'buffered-1']);
     $this->queue->push('stdClass', ['clear' => 'buffered-2']);
 
-    $this->pool->clear('default', $this->queueName);
+    // The pool's broker compiles under the connection name.
+    $this->pool->clear(INTEGRATION_CONNECTION, $this->queueName);
 
-    expect($this->pool->size('default', $this->queueName))->toBe(0);
+    expect($this->pool->size(INTEGRATION_CONNECTION, $this->queueName))->toBe(0);
 });
