@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Goopil\RabbitRs\Laravel;
 
 use Goopil\RabbitRs\Laravel\Connectors\RabbitMqConnector;
+use Goopil\RabbitRs\Laravel\Console\RabbitMqDoctorCommand;
 use Goopil\RabbitRs\Laravel\Console\RabbitMqStatusCommand;
+use Goopil\RabbitRs\Laravel\Console\RabbitMqTopologyCommand;
 use Goopil\RabbitRs\Laravel\Console\RabbitMqWorkCommand;
 use Goopil\RabbitRs\Laravel\Console\RabbitMqWorkCommandExtension;
 use Goopil\RabbitRs\Laravel\Exceptions\MissingExtensionException;
@@ -31,7 +33,7 @@ class RabbitMqServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->registerQueueConnector();
-        $this->commands([RabbitMqStatusCommand::class, RabbitMqWorkCommand::class]);
+        $this->commands([RabbitMqStatusCommand::class, RabbitMqWorkCommand::class, RabbitMqDoctorCommand::class, RabbitMqTopologyCommand::class]);
         $this->registerWorkCommandExtension();
         $this->registerOctaneLifecycle();
 
@@ -83,7 +85,7 @@ class RabbitMqServiceProvider extends ServiceProvider
 
     /**
      * Register the WorkCommand extension so that supervised `queue:work`
-     * children tag their logs with the worker index from RABBIT_RS_WORKER.
+     * children tag their logs with the worker index from RABBIT_RS_WORKER_INDEX.
      */
     private function registerWorkCommandExtension(): void
     {
