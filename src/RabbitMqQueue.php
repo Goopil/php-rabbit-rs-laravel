@@ -14,6 +14,7 @@ use Goopil\RabbitRs\Laravel\Events\ConnectionStateChanged;
 use Goopil\RabbitRs\Laravel\Exceptions\QueueException;
 use Goopil\RabbitRs\Laravel\Jobs\RabbitMqJob;
 use Goopil\RabbitRs\Laravel\Support\MessageMapper;
+use Goopil\RabbitRs\Laravel\Support\ProbeStatefile;
 use Goopil\RabbitRs\Laravel\Support\WorkerProfileResolver;
 use Goopil\RabbitRs\Pool;
 use Illuminate\Contracts\Queue\ClearableQueue;
@@ -24,12 +25,11 @@ use InvalidArgumentException;
 
 /**
  * @noinspection PhpTooManyMethodsInspection
- * @phpstan-ignore-next-line
  *
  * Method count is dictated by the Illuminate\Contracts\Queue\Queue interface
  * and Laravel's Queue base class. Splitting would add indirection on the hot path.
  */
-class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
+class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
 {
     protected const CONTENT_TYPE_JSON = 'application/json';
 
@@ -39,8 +39,8 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
     private MessageMapper $messages;
 
     /**
-     * @param array<string, array<string, mixed>> $routes
-     * @param array{confirm_timeout?: int} $publisherConfig
+     * @param  array<string, array<string, mixed>>  $routes
+     * @param  array{confirm_timeout?: int}  $publisherConfig
      */
     public function __construct(
         private readonly Pool $pool,
@@ -96,6 +96,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function onConnectionState(string $broker, string $state, int $generation): void
     {
+        $this->probeStatefile()?->recordConnectionState($broker, $state);
         app('events')->dispatch(new ConnectionStateChanged($broker, $state, $generation));
     }
 
@@ -118,8 +119,12 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         $route = $this->route($queueName);
 
         try {
+            // Force-flush the publish buffer before reading so a size() right
+            // after a same-process dispatch sees the real depth (issue #194).
+            $this->pool->flush();
+
             return $this->pool->size($route['broker'], $queueName);
-        } catch (BackpressureException | ConnectionException $exception) {
+        } catch (BackpressureException|ConnectionException $exception) {
             throw $exception;
         } catch (NativeException $exception) {
             throw QueueException::fromNative($exception);
@@ -152,13 +157,18 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         $route = $this->route($queueName);
 
         try {
+            // Force-flush the publish buffer first (issue #194) so the
+            // measured count and the purge see publications buffered by
+            // same-process dispatches.
+            $this->pool->flush();
+
             // The native purge does not surface the AMQP message count, so the
             // pending count is measured before purging: this is the number of
             // jobs the purge removes (messages racing the purge are counted
             // but may survive). queue:clear sums the returned counts.
             $purged = $this->pool->size($route['broker'], $queueName);
             $this->pool->clear($route['broker'], $queueName);
-        } catch (BackpressureException | ConnectionException $exception) {
+        } catch (BackpressureException|ConnectionException $exception) {
             throw $exception;
         } catch (NativeException $exception) {
             throw QueueException::fromNative($exception);
@@ -184,6 +194,11 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         );
     }
 
+    /**
+     * @param  string  $payload
+     * @param  string|null  $queue
+     * @param  array<string, mixed>  $options
+     */
     public function pushRaw($payload, $queue = null, array $options = [])
     {
         return $this->publish($payload, $queue, $options);
@@ -207,6 +222,16 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         );
     }
 
+    /**
+     * Returns the native message ids of the jobs published immediately
+     * (after-commit jobs are deferred and reported through the transaction
+     * callback), or null when only deferred jobs were given.
+     *
+     * @param  array<array-key, \Closure|string|object>|string  $jobs
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return list<string>|null
+     */
     public function bulk($jobs, $data = '', $queue = null)
     {
         $jobs = array_values((array) $jobs);
@@ -220,6 +245,9 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             : $this->publishBatch($this->prepareBatch($immediate, $data, $queue), $queue);
 
         if ($afterCommit !== []) {
+            // The parent method only exists since Laravel 13; the driver still
+            // supports Laravel 12, where this registration is simply absent.
+            // @phpstan-ignore function.alreadyNarrowedType (parent method is absent in Laravel 12)
             if (method_exists($this, 'registerRollbackCallbacksForJobsThatDispatchAfterCommit')) {
                 foreach ($afterCommit as $job) {
                     $this->registerRollbackCallbacksForJobsThatDispatchAfterCommit($job);
@@ -236,7 +264,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * @param list<mixed> $jobs
+     * @param  list<mixed>  $jobs
      * @return array{list<mixed>, list<mixed>}
      */
     protected function partitionJobsByAfterCommit(array $jobs): array
@@ -259,7 +287,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * @param list<mixed> $jobs
+     * @param  list<mixed>  $jobs
      * @return list<array{job: mixed, delay: mixed, payload: string, native: array<string, mixed>}>
      */
     protected function prepareBatch(array $jobs, mixed $data, mixed $queue): array
@@ -287,7 +315,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * @param list<array{job: mixed, delay: mixed, payload: string, native: array<string, mixed>}> $messages
+     * @param  list<array{job: mixed, delay: mixed, payload: string, native: array<string, mixed>}>  $messages
      * @return list<string>
      */
     protected function publishBatch(array $messages, mixed $queue): array
@@ -303,7 +331,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
 
         try {
             $messageIds = $this->pool->publishBatch(array_column($messages, 'native'));
-        } catch (BackpressureException | ConnectionException $exception) {
+        } catch (BackpressureException|ConnectionException $exception) {
             throw $exception;
         } catch (NativeException $exception) {
             throw QueueException::fromNative($exception);
@@ -328,7 +356,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             return null;
         }
 
-        if (method_exists($this, 'getAttributeValue') && class_exists(Delay::class)) {
+        if (class_exists(Delay::class)) {
             return $this->getAttributeValue($job, Delay::class, 'delay');
         }
 
@@ -360,7 +388,11 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
                     // ConnectionException carrying the drained message.
                     ConnectionException::throw($error['message'] ?? 'settlement error: '.$kind);
                 }
-                if (! isset($this->container)) {
+                // The parent $container is a non-nullable typed property, but
+                // fake-driven unit tests construct the queue without it:
+                // isset() is the only safe initialization check, and PHPStan
+                // cannot model typed-property initialization.
+                if (! isset($this->container)) { // @phpstan-ignore-line
                     continue;
                 }
                 // A MaxAttempts or InvalidDelay settlement is terminal poison
@@ -370,6 +402,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
                 // at error level with the core's error context.
                 if (in_array($kind, ['MaxAttempts', 'InvalidDelay'], true)) {
                     $this->container->make('log')->error('rabbit-rs: poison delivery settled', $error);
+
                     continue;
                 }
                 $this->container->make('log')->warning('rabbit-rs settlement error', $error);
@@ -400,8 +433,13 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         }
     }
 
+    /**
+     * @param  string|null  $queue
+     * @param  int  $index
+     */
     public function pop($queue = null, $index = 0)
     {
+        $probe = $this->probeTurn();
         $this->drainSettlementErrors();
 
         if ($queue === null) {
@@ -438,6 +476,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             unset($this->consumers[$profile]);
             throw QueueException::fromNative($exception);
         }
+        $probe?->markRunning();
         if ($delivery === null) {
             return null;
         }
@@ -465,6 +504,8 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
      * requeue=false toward the dead-letter exchange when one is configured,
      * otherwise explicitly acknowledged. The action is logged loudly on the
      * Log facade in both cases.
+     *
+     * @param  array<string, mixed>  $metadata
      */
     private function settleUnmarshable(
         Delivery $delivery,
@@ -479,7 +520,9 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             $action = 'acknowledged and dropped (no dead-letter exchange configured)';
         }
 
-        if (isset($this->container)) {
+        // Same typed-property initialization check as drainSettlementErrors:
+        // unit tests construct the queue without a container.
+        if (isset($this->container)) { // @phpstan-ignore-line
             $this->container->make('log')->error('rabbit-rs: poison delivery settled', [
                 'message_id' => $metadata['message_id'] ?? null,
                 'attempts' => $metadata['attempts'] ?? null,
@@ -487,6 +530,45 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
                 'action' => $action,
             ]);
         }
+    }
+
+    /**
+     * Resolves the process-wide probe statefile writer; null when the
+     * runtime cannot provide one (no container, or the singleton not bound
+     * outside the service provider).
+     */
+    private function probeStatefile(): ?ProbeStatefile
+    {
+        // Same typed-property initialization check as drainSettlementErrors:
+        // unit tests construct the queue without a container.
+        if (! isset($this->container) || ! $this->container->bound(ProbeStatefile::class)) { // @phpstan-ignore-line
+            return null;
+        }
+
+        return $this->container->make(ProbeStatefile::class);
+    }
+
+    /**
+     * Refreshes the worker probe statefile at the start of each consume-loop
+     * turn (throttled to the heartbeat window): the pool stats fetch happens
+     * only when a write is due. A pending pipelined publish failure surfaced
+     * by stats() propagates like any other pool operation in pop().
+     */
+    private function probeTurn(): ?ProbeStatefile
+    {
+        $probe = $this->probeStatefile();
+        if ($probe === null || ! $probe->due()) {
+            return $probe;
+        }
+
+        $stats = $this->pool->stats();
+        $probe->heartbeat(
+            (int) ($stats['deliveries_total'] ?? 0),
+            (int) ($stats['acks_total'] ?? 0),
+            (int) ($stats['rejects_total'] ?? 0),
+        );
+
+        return $probe;
     }
 
     /**
@@ -513,6 +595,9 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
         $this->closeConsumers();
     }
 
+    /**
+     * @param  string|null  $queue
+     */
     public function marshalJob(Delivery $delivery, $queue = null): RabbitMqJob
     {
         return new RabbitMqJob(
@@ -524,7 +609,7 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * @param array<string, mixed> $options
+     * @param  array<string, mixed>  $options
      */
     protected function publish(
         string $payload,
@@ -541,9 +626,13 @@ class RabbitMqQueue extends Queue implements QueueContract, ClearableQueue
             $delayMilliseconds,
         );
 
+        // BackpressureException and ConnectionException propagate untouched:
+        // the pool surface throws them directly and no translation applies.
         try {
             return $this->pool->publish($message);
-        } catch (BackpressureException | ConnectionException $exception) {
+        } catch (BackpressureException|ConnectionException $exception) {
+            // Shield: these dedicated types extend the native base, so the
+            // broader translation catch below would wrap them.
             throw $exception;
         } catch (NativeException $exception) {
             throw QueueException::fromNative($exception);

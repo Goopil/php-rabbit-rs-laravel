@@ -13,7 +13,7 @@ require_once __DIR__.'/bootstrap.php';
 
 uses(TestCase::class)->in(__DIR__);
 
-class TestException extends \Exception {}
+class TestException extends Exception {}
 
 /** Default test connection name: brokers and worker profiles compile under it. */
 const INTEGRATION_CONNECTION = 'rabbit-rs-integration';
@@ -28,7 +28,8 @@ const ORDERS_VHOST = '/orders-eu';
  */
 function bootFakeNativeExtension(mixed $app): void
 {
-    (new class($app) extends RabbitMqServiceProvider {
+    (new class($app) extends RabbitMqServiceProvider
+    {
         protected function nativeExtensionLoaded(): bool
         {
             return true;
@@ -56,6 +57,31 @@ function liveConfig(string $queueName): array
 function uniqueQueue(string $prefix = 'rabbit-rs-it'): string
 {
     return $prefix.'-'.uniqid('', true);
+}
+
+/**
+ * Fresh temp directory for worker probe statefile tests.
+ */
+function probeTempDir(): string
+{
+    $dir = sys_get_temp_dir().'/rabbit-rs-probe-tests-'.uniqid('', true);
+    mkdir($dir, 0777, true);
+
+    return $dir;
+}
+
+/**
+ * Recursively removes a probe test directory.
+ */
+function probeRmDir(string $dir): void
+{
+    if (! is_dir($dir)) {
+        return;
+    }
+    foreach (glob($dir.'/*') ?: [] as $entry) {
+        is_dir($entry) ? probeRmDir($entry) : @unlink($entry);
+    }
+    @rmdir($dir);
 }
 
 /**
@@ -144,4 +170,3 @@ function integrationPoolAndQueue(
 
     return [$pool, $queue];
 }
-

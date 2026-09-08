@@ -27,7 +27,7 @@ function adminRoutes(): array
 }
 
 /**
- * @param array<string, array<string, string>> $routes
+ * @param  array<string, array<string, string>>  $routes
  */
 function newAdminQueue(
     Pool $pool,
@@ -94,7 +94,7 @@ describe('size', function (): void {
             'orders' => adminRoutes()['orders'],
         ], 'missing');
 
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('routes.missing');
 
         $queue->size();
@@ -148,5 +148,27 @@ describe('clear', function (): void {
         $pool->sizeResults['default-broker:default'] = 0;
 
         expect(0)->toBe($queue->clear());
+    });
+});
+
+describe('publish buffer flush on read', function (): void {
+    it('flushes the publish buffer before size() reads the depth', function (): void {
+        [$queue, $pool] = adminQueue();
+        $queue->pushRaw('payload');
+
+        $queue->size();
+
+        expect($pool->flushCalls)->toBe(1)
+            ->and($pool->callOrder)->toBe(['publish', 'flush', 'size']);
+    });
+
+    it('flushes the publish buffer before clear() measures and purges', function (): void {
+        [$queue, $pool] = adminQueue();
+        $queue->pushRaw('payload');
+
+        $queue->clear();
+
+        expect($pool->flushCalls)->toBe(1)
+            ->and($pool->callOrder)->toBe(['publish', 'flush', 'size', 'clear']);
     });
 });

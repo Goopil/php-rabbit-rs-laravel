@@ -14,6 +14,7 @@ use Goopil\RabbitRs\Laravel\Support\RabbitRsConnections;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
 use InvalidArgumentException;
+use Laravel\Horizon\Horizon;
 
 /**
  * One-shot integration diagnostics: per rabbit-rs connection, runs the
@@ -69,7 +70,7 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $config
+     * @param  array<string, mixed>  $config
      */
     private function doctorConnection(string $name, array $config, DoctorProbe $probe): void
     {
@@ -85,7 +86,7 @@ final class RabbitMqDoctorCommand extends Command
         }
 
         $extensionUsable = $this->checkExtension($probe);
-        $workerClass = $this->checkWorker($name, $config);
+        $workerClass = $this->checkWorker($config);
         $brokerError = $this->checkBroker($compiled, $probe, $extensionUsable);
         $this->checkManagement($config);
         $this->checkTopology($compiled, $brokerError);
@@ -117,20 +118,15 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $config
+     * @param  array<string, mixed>  $config
      */
-    private function checkWorker(string $name, array $config): string
+    private function checkWorker(array $config): string
     {
         $defaults = RabbitRsConnections::packageDefaults();
         $class = RabbitMqConnector::workerClass($config, $defaults);
 
         if (($config['worker'] ?? null) === null && ($defaults['worker'] ?? 'default') !== 'default') {
-            $this->emit(
-                'warn',
-                "worker resolves to {$class} through the package defaults (config/rabbit-rs.php), not the "
-                ."connection — inheritance trap: set worker => 'horizon' explicitly on "
-                ."queue.connections.{$name}.worker so the Horizon worker is pinned to this connection",
-            );
+            $this->emit('ok', "worker class: {$class} (resolved through the package defaults)");
         } else {
             $this->emit('ok', "worker class: {$class}");
         }
@@ -139,7 +135,7 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      * @return string|null null when the broker is reachable, the probe error,
      *                     or the BROKER_SKIPPED sentinel
      */
@@ -173,7 +169,7 @@ final class RabbitMqDoctorCommand extends Command
      * Optional management API check: reachable when configured, advisory
      * only (the API is not needed by the driver itself).
      *
-     * @param array<string, mixed> $config
+     * @param  array<string, mixed>  $config
      */
     private function checkManagement(array $config): void
     {
@@ -206,7 +202,7 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      */
     private function checkTopology(array $compiled, ?string $brokerError): void
     {
@@ -254,7 +250,7 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      */
     private function checkSafety(array $compiled): void
     {
@@ -281,12 +277,12 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      */
     private function checkHorizon(string $name, string $workerClass, array $compiled): void
     {
         $horizonConfig = config('horizon');
-        $installed = class_exists(\Laravel\Horizon\Horizon::class);
+        $installed = class_exists(Horizon::class);
 
         if ($workerClass !== HorizonRabbitMqQueue::class
             && ! ($installed && is_array($horizonConfig))
@@ -300,9 +296,11 @@ final class RabbitMqDoctorCommand extends Command
             $this->emit('warn', 'worker=horizon but laravel/horizon is not installed — composer require laravel/horizon');
         }
 
-        $supervisors = is_array($horizonConfig) ? ($horizonConfig['supervisors'] ?? []) : [];
-        if (! is_array($supervisors) || $supervisors === []) {
-            $this->emit('warn', 'no supervisors configured in config/horizon.php');
+        $environment = $this->laravel->environment();
+        $environments = is_array($horizonConfig) ? ($horizonConfig['environments'] ?? []) : [];
+        $envSupervisors = is_array($environments) ? ($environments[$environment] ?? []) : [];
+        if (! is_array($envSupervisors) || $envSupervisors === []) {
+            $this->emit('warn', "no supervisors configured for the {$environment} environment in config/horizon.php");
 
             return;
         }
@@ -311,8 +309,8 @@ final class RabbitMqDoctorCommand extends Command
         $matched = false;
         $ok = true;
 
-        foreach ($supervisors as $supervisor) {
-            if (! is_array($supervisor)) {
+        foreach ($envSupervisors as $supervisorName => $supervisor) {
+            if (! is_array($supervisor) || ($supervisor['connection'] ?? null) !== $name) {
                 continue;
             }
             $supervisorQueues = $supervisor['queue'] ?? [];
@@ -323,7 +321,7 @@ final class RabbitMqDoctorCommand extends Command
                 continue;
             }
             $matched = true;
-            $label = is_string($supervisor['name'] ?? null) ? $supervisor['name'] : '(unnamed)';
+            $label = is_string($supervisorName) ? $supervisorName : '(unnamed)';
 
             $unknownQueues = array_diff($supervisorQueues, $queues);
             if ($unknownQueues !== []) {
@@ -331,7 +329,7 @@ final class RabbitMqDoctorCommand extends Command
                 $this->emit(
                     'warn',
                     sprintf(
-                        "supervisor %s lists queue(s) %s that are not subscriptions of this connection — jobs for them will never be consumed by its worker profiles",
+                        'supervisor %s lists queue(s) %s that are not subscriptions of this connection — jobs for them will never be consumed by its worker profiles',
                         $label,
                         implode(', ', $unknownQueues),
                     ),
@@ -400,7 +398,7 @@ final class RabbitMqDoctorCommand extends Command
     }
 
     /**
-     * @param 'ok'|'warn'|'fail' $status
+     * @param  'ok'|'warn'|'fail'  $status
      */
     private function emit(string $status, string $message): void
     {

@@ -10,11 +10,12 @@ use Symfony\Component\Process\Process;
 /**
  * @phpstan-type ProcessFactory \Closure(int): Process
  * @phpstan-type WorkPlanEntry array{connection: string, queues: list<string>}
- * @phpstan-type WorkerOptions array{timeout?: int|null, tries?: int|null, memory?: int|null, max-jobs?: int|null, max-time?: int|null}
+ * @phpstan-type WorkerOptions array{timeout?: int|null, tries?: int|null, memory?: int|null, max-jobs?: int|null, max-time?: int|null, stop-when-empty?: bool}
  */
 class WorkerSupervisor
 {
     public const EXIT_CLEAN = 0;
+
     public const EXIT_MAX_RESTARTS = 1;
 
     /**
@@ -32,15 +33,15 @@ class WorkerSupervisor
     private const PROPAGATED_OPTIONS = ['timeout', 'tries', 'memory', 'max-jobs', 'max-time'];
 
     /**
-     * @param list<WorkPlanEntry> $plan One entry per targeted connection; each
-     *         child consumes one entry's queues via
-     *         `queue:work <connection> --queue=<q1,q2>` (the connection is
-     *         the positional argument of Laravel's WorkCommand).
-     * @param int $workers Children spawned per plan entry.
-     * @param ?ProcessFactory $processFactory Optional override used by tests
-     *         to spawn a stub process instead of `queue:work`.
-     * @param WorkerOptions $options Worker options to propagate to child processes.
-     *         Keys: timeout, tries, memory, max-jobs, max-time. Null values are omitted.
+     * @param  list<WorkPlanEntry>  $plan  One entry per targeted connection; each
+     *                                     child consumes one entry's queues via
+     *                                     `queue:work <connection> --queue=<q1,q2>` (the connection is
+     *                                     the positional argument of Laravel's WorkCommand).
+     * @param  int  $workers  Children spawned per plan entry.
+     * @param  ?ProcessFactory  $processFactory  Optional override used by tests
+     *                                           to spawn a stub process instead of `queue:work`.
+     * @param  WorkerOptions  $options  Worker options to propagate to child processes.
+     *                                  Keys: timeout, tries, memory, max-jobs, max-time. Null values are omitted.
      */
     public function __construct(
         private readonly array $plan,
@@ -81,7 +82,7 @@ class WorkerSupervisor
     }
 
     /**
-     * @param WorkPlanEntry $entry
+     * @param  WorkPlanEntry  $entry
      * @return list<string>
      */
     private function childCommand(int $workerIndex, array $entry): array
@@ -105,6 +106,10 @@ class WorkerSupervisor
             }
         }
 
+        if ($this->stopsWhenEmpty()) {
+            $cmd[] = '--stop-when-empty';
+        }
+
         return $cmd;
     }
 
@@ -114,6 +119,17 @@ class WorkerSupervisor
     public static function workerEnv(): string
     {
         return self::WORKER_ENV;
+    }
+
+    /**
+     * Whether the once mode (stop-when-empty) is active: children run once
+     * with `--stop-when-empty` and are never recycled or restarted; the
+     * supervisor exits once every child has terminated, propagating the
+     * highest child exit status.
+     */
+    private function stopsWhenEmpty(): bool
+    {
+        return (bool) ($this->options['stop-when-empty'] ?? false);
     }
 
     /**
@@ -151,7 +167,7 @@ class WorkerSupervisor
      * pcntl function is needed on that path.
      *
      * @throws SupervisorException when ext-pcntl is not available and more
-     *         than one child is configured
+     *                             than one child is configured
      */
     public function run(): int
     {
@@ -165,7 +181,7 @@ class WorkerSupervisor
             throw new SupervisorException('ext-pcntl is required to supervise multiple workers. Install ext-pcntl or target a single connection.');
         }
 
-        return $this->runInternal($children);
+        return $this->stopsWhenEmpty() ? $this->runOnce($children) : $this->runInternal($children);
     }
 
     /**
@@ -188,7 +204,7 @@ class WorkerSupervisor
      * disposition terminates the supervisor, leaving the child to stop on
      * its own.
      *
-     * @param list<list<string>> $children Exactly one child command.
+     * @param  list<list<string>>  $children  Exactly one child command.
      */
     private function runInline(array $children): int
     {
@@ -197,6 +213,12 @@ class WorkerSupervisor
 
         while (true) {
             $process->wait();
+
+            if ($this->stopsWhenEmpty()) {
+                // Once mode: the child's exit is terminal, its status is the
+                // supervisor's.
+                return $process->getExitCode() ?? self::EXIT_CLEAN;
+            }
 
             if ($this->isCleanExit($process)) {
                 // Planned recycling (e.g. --max-jobs reached): reset the
@@ -229,8 +251,63 @@ class WorkerSupervisor
     }
 
     /**
-     * @param list<list<string>> $children One command per child process,
-     *         indexed by worker index.
+     * Once mode (stop-when-empty): every child runs exactly once and is
+     * never restarted. The supervisor returns once every child has
+     * terminated, propagating the highest child exit status (a crashed
+     * child therefore fails the command instead of recycling). On
+     * SIGTERM/SIGINT, children are stopped gracefully and the command
+     * exits clean.
+     *
+     * @param  list<list<string>>  $children  One command per child process,
+     *                                        indexed by worker index.
+     */
+    private function runOnce(array $children): int
+    {
+        $shutdown = false;
+        pcntl_async_signals(true);
+        pcntl_signal(SIGTERM, static function () use (&$shutdown): void {
+            $shutdown = true;
+        });
+        pcntl_signal(SIGINT, static function () use (&$shutdown): void {
+            $shutdown = true;
+        });
+
+        $processes = [];
+        foreach ($children as $index => $command) {
+            $processes[$index] = $this->startProcess($index, $command);
+        }
+
+        do {
+            $pending = false;
+            foreach ($processes as $process) {
+                if ($process->isRunning()) {
+                    $pending = true;
+
+                    break;
+                }
+            }
+            if ($pending && ! $shutdown) {
+                usleep(100_000);
+            }
+        } while ($pending && ! $shutdown);
+
+        if ($shutdown) {
+            $this->stopAllProcesses($processes);
+
+            return self::EXIT_CLEAN;
+        }
+
+        $exitCodes = [];
+        foreach ($processes as $process) {
+            $exitCodes[] = $process->getExitCode() ?? self::EXIT_CLEAN;
+        }
+
+        return $exitCodes === [] ? self::EXIT_CLEAN : max($exitCodes);
+    }
+
+    /**
+     * @param  list<list<string>>  $children  One command per child process,
+     *                                        indexed by worker index.
      */
     private function runInternal(array $children): int
     {
@@ -280,6 +357,7 @@ class WorkerSupervisor
                         $restartAt[$index] = 0.0;
                         $processes[$index] = $this->startProcess($index, $children[$index]);
                     }
+
                     continue;
                 }
 
@@ -305,7 +383,7 @@ class WorkerSupervisor
     /**
      * Stop all running child processes gracefully.
      *
-     * @param array<int, Process> $processes
+     * @param  array<int, Process>  $processes
      */
     private function stopAllProcesses(array $processes): void
     {
@@ -317,7 +395,7 @@ class WorkerSupervisor
     }
 
     /**
-     * @param list<string> $command The child command for this worker index.
+     * @param  list<string>  $command  The child command for this worker index.
      */
     private function startProcess(int $workerIndex, array $command): Process
     {

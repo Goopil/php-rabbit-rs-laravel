@@ -20,6 +20,7 @@ class RabbitMqWorkCommand extends Command
         {--memory=128 : The memory limit in megabytes}
         {--max-jobs= : The number of jobs to process before stopping}
         {--max-time= : The maximum number of seconds the worker should run}
+        {--stop-when-empty : Process pending jobs then exit once the children terminate (once mode for CI smoke tests; children get --stop-when-empty and are never recycled)}
         {--rabbit-rs-worker= : Worker index for logging/metrics attribution (direct invocation only; the supervisor passes it via RABBIT_RS_WORKER_INDEX)}';
 
     protected $description = 'Supervise Rabbit RS queue workers across connections with automatic restart';
@@ -47,16 +48,17 @@ class RabbitMqWorkCommand extends Command
      * Extracted as a protected method so tests can substitute a supervisor
      * that does not spawn real child processes.
      *
-     * @param list<array{connection: string, queues: list<string>}> $plan
+     * @param  list<array{connection: string, queues: list<string>}>  $plan
      */
     protected function createSupervisor(array $plan): WorkerSupervisor
     {
         $options = [
-            'timeout'  => (int) $this->option('timeout'),
-            'tries'    => $this->option('tries') !== null ? (int) $this->option('tries') : null,
-            'memory'   => (int) $this->option('memory'),
+            'timeout' => (int) $this->option('timeout'),
+            'tries' => $this->option('tries') !== null ? (int) $this->option('tries') : null,
+            'memory' => (int) $this->option('memory'),
             'max-jobs' => $this->option('max-jobs') !== null ? (int) $this->option('max-jobs') : null,
             'max-time' => $this->option('max-time') !== null ? (int) $this->option('max-time') : null,
+            'stop-when-empty' => (bool) $this->option('stop-when-empty'),
         ];
 
         return new WorkerSupervisor(
@@ -71,7 +73,7 @@ class RabbitMqWorkCommand extends Command
     /**
      * One-line plan description, e.g. "eu[orders, billing], us[orders]".
      *
-     * @param list<array{connection: string, queues: list<string>}> $plan
+     * @param  list<array{connection: string, queues: list<string>}>  $plan
      */
     private function describePlan(array $plan): string
     {

@@ -56,6 +56,8 @@ namespace Laravel\Horizon {
 }
 
 namespace Laravel\Horizon\Events {
+    use Laravel\Horizon\JobPayload;
+
     if (! class_exists(RedisEvent::class, false)) {
         class RedisEvent
         {
@@ -63,11 +65,11 @@ namespace Laravel\Horizon\Events {
 
             public ?string $queue = null;
 
-            public \Laravel\Horizon\JobPayload $payload;
+            public JobPayload $payload;
 
             public function __construct(string $payload)
             {
-                $this->payload = new \Laravel\Horizon\JobPayload($payload);
+                $this->payload = new JobPayload($payload);
             }
 
             public function connection(string $connectionName): self
@@ -160,7 +162,7 @@ namespace Goopil\RabbitRs {
             private ?\Closure $ackCallback = null;
 
             /**
-             * @param array<string, mixed> $metadata
+             * @param  array<string, mixed>  $metadata
              */
             public function __construct(
                 private readonly string $body,
@@ -257,7 +259,7 @@ namespace Goopil\RabbitRs {
             }
 
             /**
-             * @param array<string, mixed> $error
+             * @param  array<string, mixed>  $error
              */
             public function pushError(array $error): void
             {
@@ -330,7 +332,14 @@ namespace Goopil\RabbitRs {
             /** @var array<string, mixed>|null */
             public ?array $statsResult = null;
 
+            public int $statsCalls = 0;
+
             public int $closeCalls = 0;
+
+            public int $flushCalls = 0;
+
+            /** @var list<string> */
+            public array $callOrder = [];
 
             private bool $closed = false;
 
@@ -355,7 +364,7 @@ namespace Goopil\RabbitRs {
             private array $publishErrors = [];
 
             /**
-             * @param array<string, mixed> $config
+             * @param  array<string, mixed>  $config
              */
             public function __construct(public readonly array $config = []) {}
 
@@ -383,7 +392,7 @@ namespace Goopil\RabbitRs {
              * Simulates an async publish outcome surfaced by the native
              * pipelined flush (see Pool::drainErrors()).
              *
-             * @param array{kind: string, message_id: string, message: string} $error
+             * @param  array{kind: string, message_id: string, message: string}  $error
              */
             public function pushPublishError(array $error): void
             {
@@ -402,10 +411,11 @@ namespace Goopil\RabbitRs {
             }
 
             /**
-             * @param array<string, mixed> $message
+             * @param  array<string, mixed>  $message
              */
             public function publish(array $message): string
             {
+                $this->callOrder[] = 'publish';
                 $this->published[] = $message;
                 $this->throwPendingException();
 
@@ -413,15 +423,22 @@ namespace Goopil\RabbitRs {
             }
 
             /**
-             * @param list<array<string, mixed>> $messages
+             * @param  list<array<string, mixed>>  $messages
              * @return list<string>
              */
             public function publishBatch(array $messages): array
             {
+                $this->callOrder[] = 'publishBatch';
                 $this->publishedBatches[] = $messages;
                 $this->throwPendingException();
 
                 return array_column($messages, 'message_id');
+            }
+
+            public function flush(): void
+            {
+                $this->callOrder[] = 'flush';
+                $this->flushCalls++;
             }
 
             public function pushDelivery(string $profile, Delivery $delivery): void
@@ -443,6 +460,7 @@ namespace Goopil\RabbitRs {
 
             public function size(string $broker, string $queue): int
             {
+                $this->callOrder[] = 'size';
                 $this->sizeCalls[] = ['broker' => $broker, 'queue' => $queue];
 
                 if ($this->nextSizeException !== null) {
@@ -459,6 +477,7 @@ namespace Goopil\RabbitRs {
 
             public function clear(string $broker, string $queue): void
             {
+                $this->callOrder[] = 'clear';
                 $this->clearCalls[] = ['broker' => $broker, 'queue' => $queue];
 
                 if ($this->nextClearException !== null) {
@@ -475,7 +494,7 @@ namespace Goopil\RabbitRs {
              * Mirrors the native extension: callbacks accumulate; all of them
              * fire on each event (audit F-17).
              *
-             * @param \Closure(string, string, int): void $callback
+             * @param  \Closure(string, string, int): void  $callback
              */
             public function onConnectionState(\Closure $callback): void
             {
@@ -488,7 +507,7 @@ namespace Goopil\RabbitRs {
              * Mirrors the native extension: callbacks accumulate; all of them
              * fire on each event (audit F-17).
              *
-             * @param \Closure(string, int, int): void $callback
+             * @param  \Closure(string, int, int): void  $callback
              */
             public function onBackpressure(\Closure $callback): void
             {
@@ -534,6 +553,8 @@ namespace Goopil\RabbitRs {
              */
             public function stats(): array
             {
+                $this->statsCalls++;
+
                 return $this->statsResult ?? [
                     'closed' => $this->closed,
                     'pid' => 12345,
@@ -585,7 +606,7 @@ namespace Goopil\RabbitRs {
                 foreach ($this->config['workers'] ?? [] as $worker) {
                     if (($worker['name'] ?? null) === $profile) {
                         if (! isset($this->consumers[$profile]) || $this->consumers[$profile]->closeCalls > 0) {
-                            $this->consumers[$profile] = new Consumer();
+                            $this->consumers[$profile] = new Consumer;
                         }
 
                         return $this->consumers[$profile];

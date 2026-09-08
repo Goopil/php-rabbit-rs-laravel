@@ -101,6 +101,7 @@ Options:
 | `--workers` | Children spawned per connection | `1` |
 | `--max-restarts` | Max restarts per worker | `3` |
 | `--backoff` | Base backoff in seconds | `1` |
+| `--stop-when-empty` | Once mode: children get `--stop-when-empty`, are never recycled, and the supervisor exits with the highest child exit status once every child has terminated (CI smoke tests) | disabled |
 
 Unknown connection or queue names fail with a typed error listing what is available. A queue defined on two targeted connections is consumed on both — see [Worker fan-out](#worker-fan-out) for the full semantics.
 
@@ -111,7 +112,7 @@ Exit codes:
 | Code | Meaning |
 |------|---------|
 | `0` | Clean shutdown (including `SIGTERM`/`SIGINT`) |
-| `1` | Max restarts exceeded |
+| `1` | Max restarts exceeded, or a child crash in `--stop-when-empty` mode (the highest child exit status is propagated) |
 
 #### Status command
 
@@ -234,6 +235,24 @@ class BackpressureListener
     public function handle(BackpressureDetected $event): void
     {
         Log::warning("Backpressure on {$event->broker}: {$event->inFlight}/{$event->capacity} in flight");
+    }
+}
+```
+
+#### RabbitRsProbeEvaluated
+
+Dispatched by `rabbit-rs:probe` before the exit code is decided. Synchronous listeners may flip `$event->verdict` to `false` to force a probe to fail (maintenance mode, external flags) and pull the pod out of rotation:
+
+```php
+use Goopil\RabbitRs\Laravel\Events\RabbitRsProbeEvaluated;
+
+class ProbeMaintenanceListener
+{
+    public function handle(RabbitRsProbeEvaluated $event): void
+    {
+        if (Maintenance::active()) {
+            $event->verdict = false;
+        }
     }
 }
 ```
@@ -455,7 +474,7 @@ The minimal connection is therefore:
 | `safety` | string | `safe` | `safe` (confirms + mandatory), `unsafe` (no confirms, no mandatory — synchronous socket write), `blind` (fire-and-forget) |
 | `confirm_timeout` | int (ms) | `30000` | Publisher confirm timeout, minimum `1000`; during a recovery, a publish parked in replay is retried once with a fresh deadline, while a confirm timeout on a live connection stays terminal |
 | `prefetch` | int | `64` | QoS prefetch per consumer channel, 1–65535 |
-| `wait_timeout` | int (ms) | `30000` | Consumer acquisition deadline, 1000–86400000 |
+| `wait_timeout` | int (ms) | `30000` | Transport (broker connection) acquisition deadline, 1000–86400000 — **not** the `pop()` wait; use `block_for` to make `pop()` block for work |
 | `max_attempts` | int | `20` | Inclusive cap on resolved delivery attempts before terminal settlement |
 | `best_effort` | bool | `false` | Gates `early_ack`/`no_ack` on this connection's subscriptions |
 | `auto_subscribe` | bool | `false` | Lets `pop()` resolve plain queue names via an implicit `__auto__.{queue}` profile synthesized by the core at first pop — see [Auto subscribe](#auto-subscribe) |
@@ -535,6 +554,7 @@ A connection value — including an explicit `null` — always wins.
 | `worker` | `RABBIT_RS_WORKER` | `default` |
 | `production_warning` | `RABBIT_RS_PRODUCTION_WARNING` | `true` |
 | `best_effort` | `RABBIT_RS_BEST_EFFORT` | `false` |
+| `probes.path` | `RABBIT_RS_PROBES_PATH` | `storage_path('framework/rabbit-rs/probes')` |
 
 Keys with no per-connection default wiring (`queue_type` = `quorum`,
 `queue_durable` = `true`, `delivery_limit` = `null`, `dead_letter` = `null`)
@@ -719,6 +739,7 @@ same as every Laravel driver.
 | `--workers=N` | `1` | Children spawned **per connection** (N connections × N workers total) |
 | `--max-restarts`, `--backoff` | `3`, `1` | Supervisor crash-loop protection |
 | `--timeout`, `--tries`, `--memory`, `--max-jobs`, `--max-time` | `60`, `—`, `128`, `—`, `—` | Propagated to each `queue:work` child |
+| `--stop-when-empty` | disabled | Once mode: children run once with `--stop-when-empty` and are never restarted; the supervisor exits with the highest child exit status once all children have terminated |
 
 ```bash
 php artisan rabbit-rs:work
@@ -1130,6 +1151,32 @@ php artisan rabbit-rs:doctor --connection=rabbit-rs
 
 One-shot health report per rabbit-rs connection, resolved through the same config compilation the driver uses. Each check prints `ok`, `warn`, or `fail`; the command exits non-zero when any check fails (warnings are allowed), which makes it usable in CI. Checks cover: extension presence and version against the composer constraint, the resolved worker class (with a warning when `worker` is inherited from the package defaults instead of the connection), broker reachability (AMQP connect, auth, vhost; optional management API probe when `management_url` is set), publisher exchange/routing-key alignment and dead-letter wiring, effective safety settings, Horizon supervisors, and event listeners.
 
+#### rabbit-rs:probe
+
+```bash
+php artisan rabbit-rs:probe {startup|ready|alive|prestop} [--max-age=5] [--timeout=20]
+```
+
+Kubernetes probes over the worker probe statefiles: exit `0` when healthy, `1` otherwise. Workers running `queue:work rabbit-rs` (including Horizon workers) write a small JSON file per PID — `storage/framework/rabbit-rs/probes/{pid}.json` (path: `rabbit-rs.probes.path`) — on every consume-loop turn (throttled to one write per second) and on every state transition, with an atomic write + rename:
+
+```json
+{"pid":123,"state":"booting|running|draining","connected":true,"consumed":42,"acked":40,"nacked":2}
+```
+
+- The **file mtime is the loop heartbeat** ("the consume loop is still turning" — process existence cannot tell you this). The file is rewritten at most once per second and at most once per loop turn: with the defaults (`block_for=0`, `queue:work --sleep=3`) an idle worker's heartbeat lands every ~3s, so keep `--max-age` above the worker sleep.
+- **`connected`** mirrors what the runtime exposes today: the native connection-state callback (`ready` vs `disconnected`/`connecting`/`recovering`); hysteresis lives in the native recovery coordinator, and before the first callback the worker reports `connected=true`.
+- Counters come from `Pool::stats()` (`deliveries_total`, `acks_total`, `rejects_total`).
+- Statefiles are **kept as post-mortem artifacts**: a dead worker's file ages out of the freshness window and is swept by the writer after an hour, so crashes can be inspected on the pod.
+
+| Probe | Healthy when | Never checks |
+|-------|--------------|--------------|
+| `alive` | At least one fresh statefile (`mtime < --max-age`) | Broker reachability — **liveness must not depend on the broker**, or a broker outage restart-loops healthy workers |
+| `ready` | Every fresh statefile has `connected=true` | — |
+| `startup` | Every fresh statefile has `state=running` (first completed loop turn) | — |
+| `prestop` | Always exits `0`; signals the fresh workers' PIDs and waits up to `--timeout` for `state ∈ {draining, stopped}` | — |
+
+Aggregation is uniform — zero fresh statefiles fail, otherwise every fresh statefile must be healthy — which covers any number of workers per pod without special cases. The `RabbitRsProbeEvaluated` event (probe name, observed state, mutable `verdict`) is dispatched before the exit code is decided, so synchronous listeners can force a probe to fail (maintenance mode, external flags).
+
 ### rabbit-rs:work supervisor
 
 The `rabbit-rs:work` command supervises `queue:work` child processes across connections. With no flags it **fans out**: one `queue:work` child per rabbit-rs connection, each consuming every queue defined on its connection (its `queue` key first, then its `subscriptions` queues); `--workers` spawns children per connection:
@@ -1150,6 +1197,7 @@ php artisan rabbit-rs:work --workers=4
 | `--max-restarts` | Max restarts per worker before giving up | `3` |
 | `--backoff` | Base backoff in seconds (doubles on each restart, max 60) | `1` |
 | `--timeout`, `--tries`, `--memory`, `--max-jobs`, `--max-time` | Propagated to each `queue:work` child | `60`, `—`, `128`, `—`, `—` |
+| `--stop-when-empty` | Once mode: children run once (with `--stop-when-empty`) and are never recycled; the supervisor exits with the highest child exit status once all children have terminated | disabled |
 | `--rabbit-rs-worker` | Worker index (set by the supervisor, not by users) | — |
 
 #### Signal handling
@@ -1164,14 +1212,14 @@ php artisan rabbit-rs:work --workers=4
 | Code | Meaning |
 |------|---------|
 | `0` | Clean shutdown (including `SIGTERM`/`SIGINT`) |
-| `1` | Max restarts exceeded |
+| `1` | Max restarts exceeded, or a child crash in `--stop-when-empty` mode (the highest child exit status is propagated) |
 
 #### How it works
 
 1. The supervisor spawns one child per targeted connection (× `--workers`), each running `php artisan queue:work <name> --queue=<q1,q2>` (the connection is `queue:work`'s positional argument)
 2. Each child gets a unique `--name=worker-{i}` and the `RABBIT_RS_WORKER_INDEX={i}` environment variable
 3. The supervisor monitors child processes every 100ms
-4. If a child exits with a non-zero code (a crash), the supervisor waits (backoff seconds) and restarts it; a clean exit (0, e.g. `--max-jobs` recycling) restarts the child immediately and resets its crash budget
+4. If a child exits with a non-zero code (a crash), the supervisor waits (backoff seconds) and restarts it; a clean exit (0, e.g. `--max-jobs` recycling) restarts the child immediately and resets its crash budget. With `--stop-when-empty`, neither happens: children run once and the supervisor exits with the highest child exit status once all children have terminated (CI smoke-test mode)
 5. On `SIGTERM`/`SIGINT`, the supervisor sends `SIGTERM` to each child and waits up to 10 seconds
 
 ### Supervisor (systemd) configuration
@@ -1266,6 +1314,25 @@ spec:
                 secretKeyRef:
                   name: rabbitmq-credentials
                   key: password
+          lifecycle:
+            preStop:
+              exec:
+                command: ["php", "artisan", "rabbit-rs:probe", "prestop", "--timeout=20"]
+          startupProbe:
+            exec:
+              command: ["php", "artisan", "rabbit-rs:probe", "startup"]
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["php", "artisan", "rabbit-rs:probe", "alive", "--max-age=5"]
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["php", "artisan", "rabbit-rs:probe", "ready", "--max-age=5"]
+            periodSeconds: 5
+            failureThreshold: 2
           resources:
             requests:
               cpu: 500m
@@ -1278,14 +1345,17 @@ spec:
 
 #### Key considerations
 
-- **`terminationGracePeriodSeconds`** — set to at least 60 seconds to allow graceful shutdown
+- **`terminationGracePeriodSeconds`** — must exceed the `prestop` `--timeout` plus the drain budget (longest job duration + shutdown time); with the defaults above, 60s leaves ~40s of drain budget after the 20s prestop wait
 - **Replicas** — each pod runs its own PHP process with its own connection pool; RabbitMQ handles load balancing across consumers
 - **Resource limits** — each worker process uses ~50-100 MB; account for `--workers` multiplied by per-worker memory
-- **Probes** — Rabbit RS does not expose HTTP health endpoints; use process liveness or a custom health check script
+- **Probes** — `rabbit-rs:probe` reads the worker statefiles (see [Diagnostics — rabbit-rs:probe](#rabbit-rsprobe)): `startup` gates pod start until workers completed their first consume loop, `alive` restarts workers whose consume loop stopped turning, `ready` pulls the pod out of Services when `connected` drops, and `prestop` starts the drain before the container's SIGTERM
+- **Keep `--max-age` above the worker heartbeat cadence** — the statefile is rewritten at most once per loop turn; with the defaults (`block_for=0`, `queue:work --sleep=3`) that is every ~3s
 
 #### Graceful shutdown in Kubernetes
 
-Kubernetes sends `SIGTERM` to the container's PID 1. The supervisor handles this signal, stops child workers gracefully, and exits with code 0. The `terminationGracePeriodSeconds` should exceed the maximum job duration plus shutdown time.
+Kubernetes sends `SIGTERM` to the container's PID 1. The supervisor handles this signal, stops child workers gracefully, and exits with code 0. The `preStop` hook (`rabbit-rs:probe prestop`) signals the workers directly and waits for them to drain **before** that SIGTERM, which is why `terminationGracePeriodSeconds` should exceed the prestop `--timeout` plus the drain budget (maximum job duration plus shutdown time).
+
+The `prestop` hook always exits `0`: whether or not the workers finished draining, Kubernetes proceeds with SIGTERM and the normal graceful-shutdown path.
 
 ### Monitoring with Prometheus
 

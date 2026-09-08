@@ -57,7 +57,7 @@ final class RabbitMqTopologyCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $config
+     * @param  array<string, mixed>  $config
      */
     private function checkConnection(string $name, array $config, DoctorProbe $probe): bool
     {
@@ -85,7 +85,10 @@ final class RabbitMqTopologyCommand extends Command
         $ok = $this->verifyManagement($name, $config, $compiled) && $ok;
 
         if ((bool) $this->option('fix')) {
-            $ok = $this->applyFix($name, $compiled, $probe) && $ok;
+            // A successful declare resolves the missing items verify reported:
+            // report the connection as fixed instead of carrying pre-fix
+            // failures (the bootstrap scenario --fix exists for, issue #195).
+            return $this->applyFix($name, $compiled, $probe);
         }
 
         return $ok;
@@ -95,7 +98,7 @@ final class RabbitMqTopologyCommand extends Command
      * Passive queue-existence probe per subscription queue; a NOT-FOUND error
      * is a missing topology item, anything else is a broker failure.
      *
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      */
     private function verifyQueues(string $name, array $compiled, DoctorProbe $probe): bool
     {
@@ -128,8 +131,8 @@ final class RabbitMqTopologyCommand extends Command
      * subscription-queue arguments. Advisory when the API is unreachable —
      * only actual mismatches fail the command.
      *
-     * @param array<string, mixed> $config
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $config
+     * @param  array<string, mixed>  $compiled
      */
     private function verifyManagement(string $name, array $config, array $compiled): bool
     {
@@ -199,7 +202,7 @@ final class RabbitMqTopologyCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $compiled
+     * @param  array<string, mixed>  $compiled
      */
     private function applyFix(string $name, array $compiled, DoctorProbe $probe): bool
     {
@@ -214,16 +217,36 @@ final class RabbitMqTopologyCommand extends Command
 
         $workerProfile = (string) ($compiled['native']['workers'][0]['name'] ?? $name);
         $error = $probe->declareTopology($compiled['native'], $workerProfile);
-        if ($error !== null) {
+        if ($error !== null && ! $this->isConsumerReadinessTimeout($error)) {
             $this->error('declaration failed');
             $this->error($error);
 
             return false;
         }
 
-        $this->info("topology declared (worker profile '{$workerProfile}')");
+        if ($error !== null) {
+            // The declare probe rides a transient consumer: the recovery
+            // generation declares the topology before consumer channels
+            // start, so a readiness timeout (e.g. no worker running for the
+            // profile) leaves the declaration successful with readiness
+            // unconfirmed. Warn instead of failing the bootstrap scenario.
+            $this->warn("topology declared (worker profile '{$workerProfile}'); consumer readiness not confirmed: {$error}");
+        } else {
+            $this->info("topology declared (worker profile '{$workerProfile}')");
+        }
 
         return true;
+    }
+
+    /**
+     * The declare probe only opens a consumer, so the native readiness
+     * timeout ("consumer profile '...' did not become ready within ...") is
+     * the one error that means declared-but-readiness-unconfirmed rather
+     * than a declaration failure.
+     */
+    private function isConsumerReadinessTimeout(string $error): bool
+    {
+        return str_contains($error, 'did not become ready within');
     }
 
     /**
@@ -249,7 +272,8 @@ final class RabbitMqTopologyCommand extends Command
     }
 
     /**
-     * @param list<array<string, mixed>> $entries
+     * @param  list<array<string, mixed>>  $entries
+     * @return array<string, mixed>|null
      */
     private function findByName(array $entries, string $name): ?array
     {
@@ -263,7 +287,7 @@ final class RabbitMqTopologyCommand extends Command
     }
 
     /**
-     * @param list<array<string, mixed>> $bindings
+     * @param  list<array<string, mixed>>  $bindings
      */
     private function bindingExists(array $bindings, string $source, string $destination): bool
     {
@@ -280,7 +304,7 @@ final class RabbitMqTopologyCommand extends Command
     }
 
     /**
-     * @param 'ok'|'warn'|'fail' $status
+     * @param  'ok'|'warn'|'fail'  $status
      */
     private function emit(string $status, string $message): void
     {

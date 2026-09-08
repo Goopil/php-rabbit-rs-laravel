@@ -44,16 +44,12 @@ function expectOptionPropagation(string $option, int $value): void
 /**
  * Runs a fork-less supervisor and asserts the ext-pcntl SupervisorException.
  *
- * @param list<array{connection: string, queues: list<string>}> $plan
+ * @param  list<array{connection: string, queues: list<string>}>  $plan
  */
 function expectPcntlMissingException(array $plan, int $workers): void
 {
-    $supervisor = new class(
-        plan: $plan,
-        workers: $workers,
-        maxRestarts: 1,
-        baseBackoffSeconds: 0,
-    ) extends WorkerSupervisor {
+    $supervisor = new class(plan: $plan, workers: $workers, maxRestarts: 1, baseBackoffSeconds: 0) extends WorkerSupervisor
+    {
         protected function canFork(): bool
         {
             return false;
@@ -195,6 +191,31 @@ describe('buildChildCommands option propagation', function (): void {
         expectOptionPropagation('max-time', 3600);
     });
 
+    it('propagates the stop-when-empty flag to child commands', function (): void {
+        $supervisor = new WorkerSupervisor(
+            plan: singlePlan(),
+            workers: 1,
+            maxRestarts: 1,
+            baseBackoffSeconds: 0,
+            options: ['stop-when-empty' => true],
+        );
+
+        expect($supervisor->buildChildCommands()[0])->toContain('--stop-when-empty');
+    });
+
+    it('omits the stop-when-empty flag by default', function (): void {
+        $supervisor = new WorkerSupervisor(
+            plan: singlePlan(),
+            workers: 1,
+            maxRestarts: 1,
+            baseBackoffSeconds: 0,
+        );
+
+        foreach ($supervisor->buildChildCommands()[0] as $arg) {
+            expect($arg)->not->toContain('--stop-when-empty');
+        }
+    });
+
     it('propagates all worker options together', function (): void {
         $supervisor = new WorkerSupervisor(
             plan: singlePlan(),
@@ -202,9 +223,9 @@ describe('buildChildCommands option propagation', function (): void {
             maxRestarts: 1,
             baseBackoffSeconds: 0,
             options: [
-                'timeout'  => 60,
-                'tries'    => 3,
-                'memory'   => 128,
+                'timeout' => 60,
+                'tries' => 3,
+                'memory' => 128,
                 'max-jobs' => 500,
                 'max-time' => 1800,
             ],
@@ -226,9 +247,9 @@ describe('buildChildCommands option propagation', function (): void {
             maxRestarts: 1,
             baseBackoffSeconds: 0,
             options: [
-                'timeout'  => 30,
-                'tries'    => null,
-                'memory'   => 128,
+                'timeout' => 30,
+                'tries' => null,
+                'memory' => 128,
                 'max-jobs' => null,
                 'max-time' => null,
             ],

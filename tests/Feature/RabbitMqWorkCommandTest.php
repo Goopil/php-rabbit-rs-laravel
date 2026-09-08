@@ -5,7 +5,12 @@ declare(strict_types=1);
 use Goopil\RabbitRs\Laravel\Console\RabbitMqWorkCommand;
 use Goopil\RabbitRs\Laravel\Console\RabbitMqWorkCommandExtension;
 use Goopil\RabbitRs\Laravel\Console\WorkerSupervisor;
+use Illuminate\Contracts\Queue\Job;
+use Illuminate\Log\LogManager;
+use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Facades\Log;
+use Mockery\MockInterface;
+use Psr\Log\LoggerInterface;
 
 const CONSOLE_KERNEL = 'Illuminate\Contracts\Console\Kernel';
 
@@ -41,6 +46,13 @@ describe('rabbit-rs:work command', function () {
             ->and($definition->hasOption('memory'))->toBeTrue()
             ->and($definition->hasOption('max-jobs'))->toBeTrue()
             ->and($definition->hasOption('max-time'))->toBeTrue();
+    });
+
+    it('command signature accepts the stop-when-empty termination flag', function () {
+        $commands = $this->app->make(CONSOLE_KERNEL)->all();
+        $command = $commands['rabbit-rs:work'];
+
+        expect($command->getDefinition()->hasOption('stop-when-empty'))->toBeTrue();
     });
 
     it('worker propagation options have expected defaults', function () {
@@ -88,7 +100,7 @@ describe('rabbit-rs worker extension', function () {
     });
 
     it('extension from environment returns index when worker env set', function () {
-        putenv(WorkerSupervisor::workerEnv() . '=3');
+        putenv(WorkerSupervisor::workerEnv().'=3');
 
         try {
             $extension = RabbitMqWorkCommandExtension::fromEnvironment();
@@ -128,7 +140,7 @@ describe('rabbit-rs worker extension', function () {
     });
 
     it('extension register logs job processing event with worker tag', function () {
-        putenv(WorkerSupervisor::workerEnv() . '=2');
+        putenv(WorkerSupervisor::workerEnv().'=2');
 
         try {
             $extension = RabbitMqWorkCommandExtension::fromEnvironment();
@@ -141,7 +153,7 @@ describe('rabbit-rs worker extension', function () {
             // Build a mock job to dispatch a real JobProcessing event.
             $job = mockQueueJob();
 
-            $events->dispatch(new \Illuminate\Queue\Events\JobProcessing('rabbit-rs', $job));
+            $events->dispatch(new JobProcessing('rabbit-rs', $job));
 
             // The extension should have logged the event with the worker tag.
             expect($logged)->not->toBeEmpty('JobProcessing event should have been logged');
@@ -184,14 +196,14 @@ describe('rabbit-rs:work command handle wiring', function () {
 
             // Intercept Log::channel() calls to capture the worker tag.
             $logged = [];
-            $logChannel = \Mockery::mock(\Psr\Log\LoggerInterface::class);
+            $logChannel = Mockery::mock(LoggerInterface::class);
             $logChannel->shouldReceive('info')
-                ->with('rabbit-rs worker', \Mockery::on(function ($context) use (&$logged): bool {
+                ->with('rabbit-rs worker', Mockery::on(function ($context) use (&$logged): bool {
                     $logged[] = ['level' => 'info', 'context' => $context];
 
                     return true;
                 }));
-            $logManager = \Mockery::mock(\Illuminate\Log\LogManager::class);
+            $logManager = Mockery::mock(LogManager::class);
             $logManager->shouldReceive('channel')->andReturn($logChannel);
             Log::swap($logManager);
 
@@ -204,7 +216,7 @@ describe('rabbit-rs:work command handle wiring', function () {
             $events = $this->app->make('events');
             $job = mockQueueJob();
 
-            $events->dispatch(new \Illuminate\Queue\Events\JobProcessing('rabbit-rs', $job));
+            $events->dispatch(new JobProcessing('rabbit-rs', $job));
 
             expect($logged)->not->toBeEmpty('JobProcessing event should have been logged via the extension wired in handle()');
             expect($logged[0]['context']['worker'])->toBe('[worker-2]');
@@ -223,9 +235,9 @@ describe('rabbit-rs:work command handle wiring', function () {
         try {
             registerTestWorkCommand($this->app);
 
-            $logChannel = \Mockery::mock(\Psr\Log\LoggerInterface::class);
+            $logChannel = Mockery::mock(LoggerInterface::class);
             $logChannel->shouldNotReceive('info');
-            $logManager = \Mockery::mock(\Illuminate\Log\LogManager::class);
+            $logManager = Mockery::mock(LogManager::class);
             $logManager->shouldReceive('channel')->andReturn($logChannel);
             Log::swap($logManager);
 
@@ -237,7 +249,7 @@ describe('rabbit-rs:work command handle wiring', function () {
             $events = $this->app->make('events');
             $job = mockQueueJob();
 
-            $events->dispatch(new \Illuminate\Queue\Events\JobProcessing('rabbit-rs', $job));
+            $events->dispatch(new JobProcessing('rabbit-rs', $job));
         } finally {
             putenv(WorkerSupervisor::workerEnv());
         }
@@ -283,6 +295,26 @@ describe('rabbit-rs:work plan fan-out wiring', function () {
             ['connection' => 'us', 'queues' => ['orders']],
         ]);
     });
+
+    it('wires --stop-when-empty into the supervisor and its child commands', function () {
+        $command = registerTestWorkCommand($this->app);
+
+        $this->artisan('test:work-command', ['--stop-when-empty' => true])
+            ->assertSuccessful();
+
+        expect($command->capturedSupervisor)->not->toBeNull()
+            ->and($command->capturedSupervisor->buildChildCommands()[0])->toContain('--stop-when-empty');
+    });
+
+    it('does not propagate --stop-when-empty when the flag is absent', function () {
+        $command = registerTestWorkCommand($this->app);
+
+        $this->artisan('test:work-command')->assertSuccessful();
+
+        foreach ($command->capturedSupervisor->buildChildCommands()[0] as $arg) {
+            expect($arg)->not->toContain('--stop-when-empty');
+        }
+    });
 });
 
 /**
@@ -290,17 +322,21 @@ describe('rabbit-rs:work plan fan-out wiring', function () {
  * out the supervisor so run() does not spawn real child processes.
  * Returns the registered command so tests can inspect the resolved plan.
  */
-function registerTestWorkCommand($app): \Goopil\RabbitRs\Laravel\Console\RabbitMqWorkCommand
+function registerTestWorkCommand($app): RabbitMqWorkCommand
 {
-    $stubSupervisor = new class([['connection' => 'rabbit-rs', 'queues' => ['default']]], 1, 3, 1, null, []) extends WorkerSupervisor {
+    $stubSupervisor = new class([['connection' => 'rabbit-rs', 'queues' => ['default']]], 1, 3, 1, null, []) extends WorkerSupervisor
+    {
         public function run(): int
         {
             return WorkerSupervisor::EXIT_CLEAN;
         }
     };
 
-    $command = new class($stubSupervisor) extends RabbitMqWorkCommand {
+    $command = new class($stubSupervisor) extends RabbitMqWorkCommand
+    {
         public ?array $capturedPlan = null;
+
+        public ?WorkerSupervisor $capturedSupervisor = null;
 
         protected $signature = 'test:work-command
             {--connection= : Comma-separated queue connections}
@@ -313,6 +349,7 @@ function registerTestWorkCommand($app): \Goopil\RabbitRs\Laravel\Console\RabbitM
             {--memory=128 : The memory limit in megabytes}
             {--max-jobs= : The number of jobs to process before stopping}
             {--max-time= : The maximum number of seconds the worker should run}
+            {--stop-when-empty : Process pending jobs then exit when the queues are empty}
             {--rabbit-rs-worker= : Worker index for logging/metrics attribution (set by the supervisor)}';
 
         protected $description = 'Test command';
@@ -326,6 +363,7 @@ function registerTestWorkCommand($app): \Goopil\RabbitRs\Laravel\Console\RabbitM
         protected function createSupervisor(array $plan): WorkerSupervisor
         {
             $this->capturedPlan = $plan;
+            $this->capturedSupervisor = parent::createSupervisor($plan);
 
             return $this->supervisor;
         }
@@ -340,9 +378,9 @@ function registerTestWorkCommand($app): \Goopil\RabbitRs\Laravel\Console\RabbitM
  * Build a mock queue job with the standard expectations used to dispatch
  * a real JobProcessing event in the worker-tagging tests above.
  */
-function mockQueueJob(): \Mockery\MockInterface
+function mockQueueJob(): MockInterface
 {
-    $job = \Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+    $job = Mockery::mock(Job::class);
     $job->shouldReceive('resolveName')->andReturn('TestJob');
     $job->shouldReceive('getJobId')->andReturn('test-123');
     $job->shouldReceive('getQueue')->andReturn('default');
