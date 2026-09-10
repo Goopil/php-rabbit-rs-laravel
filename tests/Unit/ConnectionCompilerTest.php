@@ -204,6 +204,35 @@ describe('bounds', function (): void {
         'below the minimum' => [999, false],
         'at the minimum' => [1000, true],
     ]);
+
+    it('defaults flush_interval to the 1ms age-flush behavior', function (): void {
+        $compiled = ConnectionCompiler::compile('orders', ['queue' => 'default']);
+
+        expect($compiled['publisher']['flush_interval'])->toBe(1)
+            ->and($compiled['native']['publisher']['flush_interval'])->toBe(1);
+    });
+
+    it('casts an env-style flush_interval string and mirrors it into the native config', function (): void {
+        $compiled = ConnectionCompiler::compile('orders', ['queue' => 'default', 'flush_interval' => '250']);
+
+        expect($compiled['publisher']['flush_interval'])->toBe(250)
+            ->and($compiled['native']['publisher']['flush_interval'])->toBe(250);
+    });
+
+    it('bounds flush_interval between 0 and 3600000', function (int $value, bool $valid): void {
+        expectBounded(
+            fn (): array => ConnectionCompiler::compile('orders', ['queue' => 'default', 'flush_interval' => $value]),
+            fn (array $compiled): int => $compiled['publisher']['flush_interval'],
+            $value,
+            $valid,
+            'queue.connections.orders.flush_interval',
+        );
+    })->with([
+        'zero is valid (flush on every triggering operation)' => [0, true],
+        'at the maximum' => [3_600_000, true],
+        'beyond the maximum' => [3_600_001, false],
+        'negative' => [-1, false],
+    ]);
 });
 
 describe('management url', function (): void {
@@ -421,9 +450,7 @@ describe('subscriptions escape hatch', function (): void {
                 'alerts' => [
                     'queue' => 'orders.alerts',
                     'weight' => 3,
-                    'priority_class' => 2,
                     'prefetch' => 8,
-                    'starvation_after' => 10,
                     'early_ack' => true,
                     'no_ack' => false,
                 ],
@@ -434,9 +461,7 @@ describe('subscriptions escape hatch', function (): void {
             subscription('jobs'),
             subscription('alerts', [
                 'weight' => 3,
-                'priority_class' => 2,
                 'prefetch' => 8,
-                'starvation_after' => 10,
                 'early_ack' => true,
             ]),
         ]);
@@ -446,11 +471,11 @@ describe('subscriptions escape hatch', function (): void {
         $compiled = ConnectionCompiler::compile('orders', [
             'queue' => 'default',
             'prefetch' => '32',
-            'subscriptions' => ['jobs' => ['queue' => 'orders.jobs', 'weight' => '2', 'priority_class' => '1']],
+            'subscriptions' => ['jobs' => ['queue' => 'orders.jobs', 'weight' => '2']],
         ]);
 
         expect($compiled['native']['workers'][0]['subscriptions'][0])->toBe(
-            subscription('jobs', ['weight' => 2, 'priority_class' => 1, 'prefetch' => 32]),
+            subscription('jobs', ['weight' => 2, 'prefetch' => 32]),
         );
     });
 
@@ -530,23 +555,19 @@ describe('subscriptions escape hatch', function (): void {
         'beyond the maximum' => [65_536, false],
     ]);
 
-    it('bounds priority_class to i16', function (int $value, bool $valid): void {
-        expectBounded(
-            fn (): array => ConnectionCompiler::compile('orders', [
-                'queue' => 'default',
-                'subscriptions' => ['jobs' => ['queue' => 'orders.jobs', 'priority_class' => $value]],
-            ]),
-            fn (array $compiled): int => $compiled['native']['workers'][0]['subscriptions'][0]['priority_class'],
-            $value,
-            $valid,
-            'queue.connections.orders.subscriptions.jobs.priority_class',
+    it('rejects the removed priority_class knob (weight-only scheduling)', function (): void {
+        expectCompileRejected(
+            ['subscriptions' => ['jobs' => ['queue' => 'orders.jobs', 'priority_class' => 1]]],
+            'queue.connections.orders.subscriptions.jobs.priority_class: unknown key',
         );
-    })->with([
-        'at the minimum' => [-32_768, true],
-        'at the maximum' => [32_767, true],
-        'below the minimum' => [-32_769, false],
-        'beyond the maximum' => [32_768, false],
-    ]);
+    });
+
+    it('rejects the removed starvation_after knob (weight-only scheduling)', function (): void {
+        expectCompileRejected(
+            ['subscriptions' => ['jobs' => ['queue' => 'orders.jobs', 'starvation_after' => 30]]],
+            'queue.connections.orders.subscriptions.jobs.starvation_after: unknown key',
+        );
+    });
 
     it('rejects two subscriptions sharing the same queue', function (): void {
         expectCompileRejected(
@@ -719,9 +740,7 @@ function subscription(string $name, array $overrides = []): array
         'broker' => 'orders',
         'queue' => 'orders.'.$name,
         'weight' => 1,
-        'priority_class' => 0,
         'prefetch' => 64,
-        'starvation_after' => 30,
         'early_ack' => false,
         'no_ack' => false,
     ], $overrides);
@@ -781,9 +800,7 @@ function referenceCompiled(string $name): array
                     'broker' => $name,
                     'queue' => 'default',
                     'weight' => 1,
-                    'priority_class' => 0,
                     'prefetch' => 64,
-                    'starvation_after' => 30,
                     'early_ack' => false,
                     'no_ack' => false,
                 ]],
@@ -793,13 +810,13 @@ function referenceCompiled(string $name): array
             'delay' => ['mode' => 'auto', 'buckets' => [1, 5, 30, 120], 'max_buckets' => 8, 'queue_expiry_margin' => 60],
             'dead_letter' => null,
             'delivery_limit' => null,
-            'publisher' => ['safety' => 'safe', 'confirms' => true, 'mandatory' => true, 'confirm_timeout' => 30000],
+            'publisher' => ['safety' => 'safe', 'confirms' => true, 'mandatory' => true, 'confirm_timeout' => 30000, 'flush_interval' => 1],
             'consumer' => ['wait_timeout' => 30000, 'max_attempts' => 20],
             'queue_type' => 'quorum',
             'queue_durable' => true,
         ],
         'routes' => ['default' => ['broker' => $name, 'exchange' => 'laravel.jobs', 'routing_key' => '{queue}']],
-        'publisher' => ['safety' => 'safe', 'confirms' => true, 'mandatory' => true, 'confirm_timeout' => 30000],
+        'publisher' => ['safety' => 'safe', 'confirms' => true, 'mandatory' => true, 'confirm_timeout' => 30000, 'flush_interval' => 1],
         'topology' => ['queue' => ['type' => 'quorum', 'durable' => true, 'delivery_limit' => null], 'dead_letter' => null],
         'best_effort' => false,
         'auto_subscribe' => true,
