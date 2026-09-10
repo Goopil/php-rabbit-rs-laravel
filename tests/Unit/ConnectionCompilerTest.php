@@ -14,6 +14,14 @@ describe('connection compilation', function (): void {
         expect(ConnectionCompiler::compile('orders', ['driver' => 'rabbit-rs', 'queue' => 'default']))
             ->toBe(referenceCompiled('orders'));
     });
+
+    it('mirrors the default route inside the native section for the extension', function (): void {
+        $compiled = ConnectionCompiler::compile('orders', fullConnection());
+
+        expect($compiled['native']['routes'])
+            ->toBe($compiled['routes'])
+            ->and($compiled['native']['routes']['default']['routing_key'])->toBe('{queue}');
+    });
 });
 
 describe('hosts', function (): void {
@@ -79,6 +87,7 @@ describe('env booleans', function (): void {
         $compiled = ConnectionCompiler::compile('orders', [
             'queue' => 'default',
             'auto_subscribe' => 'off',
+            'queue_type' => 'classic',
             'queue_durable' => 'no',
             'tls' => ['enabled' => 'yes'],
         ]);
@@ -86,6 +95,14 @@ describe('env booleans', function (): void {
         expect($compiled['auto_subscribe'])->toBeFalse()
             ->and($compiled['native']['queue_durable'])->toBeFalse()
             ->and($compiled['native']['brokers'][0]['tls']['enabled'])->toBeTrue();
+    });
+
+    it('rejects queue_durable=false with quorum queues', function (): void {
+        expectCompileRejected(
+            ['queue_durable' => false],
+            'queue.connections.orders.queue_durable: quorum queues are always durable — '
+            .'set queue_durable=true or queue_type=classic',
+        );
     });
 
     it('falls back to the default when auto_subscribe is null', function (): void {
@@ -276,6 +293,32 @@ describe('topology', function (): void {
 
     it('rejects an unknown queue_type with the exact path', function (): void {
         expectCompileRejected(['queue_type' => 'lazy'], 'queue.connections.orders.queue_type');
+    });
+
+    it('rejects delivery_limit on classic queues with the exact path', function (): void {
+        expectCompileRejected(
+            ['queue_type' => 'classic', 'delivery_limit' => 20],
+            'queue.connections.orders.delivery_limit',
+        );
+    });
+
+    it('compiles classic queues without delivery_limit', function (): void {
+        $compiled = ConnectionCompiler::compile('orders', ['queue' => 'default', 'queue_type' => 'classic']);
+
+        expect($compiled['native']['queue_type'])->toBe('classic')
+            ->and($compiled['native']['delivery_limit'])->toBeNull();
+    });
+
+    it('compiles durable quorum queues with delivery_limit', function (): void {
+        $compiled = ConnectionCompiler::compile('orders', [
+            'queue' => 'default',
+            'delivery_limit' => 20,
+            'dead_letter' => ['exchange' => 'dlx', 'queue' => 'dlq'],
+        ]);
+
+        expect($compiled['native']['queue_type'])->toBe('quorum')
+            ->and($compiled['native']['queue_durable'])->toBeTrue()
+            ->and($compiled['native']['delivery_limit'])->toBe(20);
     });
 });
 
@@ -814,6 +857,7 @@ function referenceCompiled(string $name): array
             'consumer' => ['wait_timeout' => 30000, 'max_attempts' => 20],
             'queue_type' => 'quorum',
             'queue_durable' => true,
+            'routes' => ['default' => ['broker' => $name, 'exchange' => 'laravel.jobs', 'routing_key' => '{queue}']],
         ],
         'routes' => ['default' => ['broker' => $name, 'exchange' => 'laravel.jobs', 'routing_key' => '{queue}']],
         'publisher' => ['safety' => 'safe', 'confirms' => true, 'mandatory' => true, 'confirm_timeout' => 30000, 'flush_interval' => 1],

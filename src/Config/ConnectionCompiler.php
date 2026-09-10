@@ -33,6 +33,8 @@ final class ConnectionCompiler
 
     private const PATH_NO_ACK = '.no_ack';
 
+    private const PATH_MODE = '.mode';
+
     /**
      * Top-level connection keys the compiler consumes. `driver` is read by
      * the queue dispatcher before compilation, not here; `after_commit` and
@@ -85,6 +87,17 @@ final class ConnectionCompiler
         $publisher = self::publisher($config, $path);
         $autoSubscribe = self::boolean($config['auto_subscribe'] ?? true, $path.'.auto_subscribe');
 
+        // The default route rides inside `native` so the extension declares
+        // the publish-side topology (exchange + {queue} bindings, issue #205)
+        // from the same source the PHP-side route resolution reads.
+        $routes = [
+            'default' => [
+                'broker' => $name,
+                'exchange' => self::exchange($config, $path),
+                'routing_key' => self::routingKey($config, $path),
+            ],
+        ];
+
         return [
             'native' => [
                 'brokers' => [$broker],
@@ -97,14 +110,9 @@ final class ConnectionCompiler
                 'consumer' => self::consumer($config, $path),
                 'queue_type' => $topology['queue']['type'],
                 'queue_durable' => $topology['queue']['durable'],
+                'routes' => $routes,
             ],
-            'routes' => [
-                'default' => [
-                    'broker' => $name,
-                    'exchange' => self::exchange($config, $path),
-                    'routing_key' => self::routingKey($config, $path),
-                ],
-            ],
+            'routes' => $routes,
             'publisher' => $publisher,
             'topology' => $topology,
             'best_effort' => $bestEffort,
@@ -413,7 +421,7 @@ final class ConnectionCompiler
             );
             if ($earlyAck || $noAck) {
                 self::invalid(
-                    $path.'.mode',
+                    $path.self::PATH_MODE,
                     'adaptive prefetch requires consumer acknowledgements: early_ack and no_ack must be false',
                 );
             }
@@ -427,7 +435,7 @@ final class ConnectionCompiler
             ];
         }
 
-        self::invalid($path.'.mode', 'must be fixed or adaptive');
+        self::invalid($path.self::PATH_MODE, 'must be fixed or adaptive');
     }
 
     /**
@@ -519,7 +527,7 @@ final class ConnectionCompiler
 
         $mode = $delay['mode'] ?? 'auto';
         if (! is_string($mode) || ! in_array($mode, ['auto', 'plugin', 'ttl'], true)) {
-            self::invalid($path.'.mode', 'must be auto, plugin, or ttl');
+            self::invalid($path.self::PATH_MODE, 'must be auto, plugin, or ttl');
         }
 
         $buckets = $delay['buckets'] ?? [1, 5, 30, 120];
@@ -555,12 +563,31 @@ final class ConnectionCompiler
             self::invalid($path.'.queue_type', 'must be quorum or classic');
         }
 
+        $durable = self::boolean($config['queue_durable'] ?? true, $path.'.queue_durable');
+        if ($type === 'quorum' && ! $durable) {
+            self::invalid(
+                $path.'.queue_durable',
+                'quorum queues are always durable — set queue_durable=true or queue_type=classic',
+            );
+        }
+
         $deliveryLimit = $config['delivery_limit'] ?? null;
         if ($deliveryLimit !== null) {
             $deliveryLimit = self::positiveInt($deliveryLimit, $path.'.delivery_limit');
         }
 
         $deadLetter = self::deadLetter($config['dead_letter'] ?? null, $path.'.dead_letter');
+
+        // RabbitMQ 4.x accepts `x-delivery-limit` only on quorum queues; reject
+        // the classic combination here (before the dead_letter coupling) so the
+        // misconfiguration surfaces without the extension loaded.
+        if ($type === 'classic' && $deliveryLimit !== null) {
+            self::invalid(
+                $path.'.delivery_limit',
+                'delivery_limit is only supported on quorum queues — '
+                .'remove it or set queue_type=quorum',
+            );
+        }
 
         if ($deliveryLimit !== null && $deadLetter === null) {
             self::invalid(
@@ -573,7 +600,7 @@ final class ConnectionCompiler
         return [
             'queue' => [
                 'type' => $type,
-                'durable' => self::boolean($config['queue_durable'] ?? true, $path.'.queue_durable'),
+                'durable' => $durable,
                 'delivery_limit' => $deliveryLimit,
             ],
             'dead_letter' => $deadLetter,
