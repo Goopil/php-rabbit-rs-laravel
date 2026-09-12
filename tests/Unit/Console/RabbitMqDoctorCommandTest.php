@@ -17,7 +17,7 @@ const BASE_QUEUE_CLASS = 'Goopil\RabbitRs\Laravel\RabbitMqQueue';
  * and without a broker, so the doctor's extension and broker probes are
  * substituted with configurable fakes.
  */
-function bindFakeProbe($app, bool $loaded = true, ?string $version = '0.3.1', ?string $brokerError = null): void
+function bindFakeProbe($app, bool $loaded = true, ?string $version = '0.3.2', ?string $brokerError = null): void
 {
     $app->instance(DoctorProbe::class, new class($loaded, $version, $brokerError) extends DoctorProbe
     {
@@ -100,6 +100,16 @@ describe('rabbit-rs:doctor worker class resolution', function () {
     });
 });
 
+describe('rabbit-rs:doctor worker capacity', function () {
+    it('reports the per-supervisor AMQP connection math', function () {
+        doctorConnection();
+
+        $this->artisan('rabbit-rs:doctor')
+            ->expectsOutputToContain('1 worker(s) × 1 broker(s) → 1 AMQP connection(s) per supervisor')
+            ->assertExitCode(0);
+    });
+});
+
 describe('rabbit-rs:doctor broker probe', function () {
     it('fails when the broker is unreachable and still runs the other checks', function () {
         bindFakeProbe($this->app, brokerError: 'connection refused');
@@ -125,7 +135,7 @@ describe('rabbit-rs:doctor broker probe', function () {
         doctorConnection();
 
         $this->artisan('rabbit-rs:doctor')
-            ->expectsOutputToContain('^0.3.1')
+            ->expectsOutputToContain('^0.3.2')
             ->assertExitCode(1);
     });
 
@@ -133,7 +143,7 @@ describe('rabbit-rs:doctor broker probe', function () {
         doctorConnection();
 
         $this->artisan('rabbit-rs:doctor')
-            ->expectsOutputToContain('0.3.1')
+            ->expectsOutputToContain('0.3.2')
             ->assertExitCode(0);
     });
 });
