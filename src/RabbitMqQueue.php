@@ -13,6 +13,7 @@ use Goopil\RabbitRs\Laravel\Events\BackpressureDetected;
 use Goopil\RabbitRs\Laravel\Events\ConnectionStateChanged;
 use Goopil\RabbitRs\Laravel\Exceptions\QueueException;
 use Goopil\RabbitRs\Laravel\Jobs\RabbitMqJob;
+use Goopil\RabbitRs\Laravel\Support\DelayPluginGuard;
 use Goopil\RabbitRs\Laravel\Support\MessageMapper;
 use Goopil\RabbitRs\Laravel\Support\ProbeStatefile;
 use Goopil\RabbitRs\Laravel\Support\WorkerProfileResolver;
@@ -58,6 +59,10 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
         // the same sweep (owner follow-up, outside this change's scope).
         private readonly bool $autoSubscribe = false, // @phpstan-ignore property.onlyWritten (deliberate compat shim, see comment above)
         private readonly bool $hasDeadLetter = false,
+        // Effective delay mode as resolved at compile time: auto may have
+        // degraded to ttl at connection compile (plugin absent), and only a
+        // still-plugin-mode connection guards its delayed publishes below.
+        private readonly string $delayMode = 'auto',
     ) {
         $this->dispatchAfterCommit = $dispatchAfterCommit;
         $this->messages = $messages ?? new MessageMapper($publisherConfig);
@@ -302,6 +307,8 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
 
         return array_map(function (mixed $job) use ($data, $queueName, $route): array {
             $delay = $this->jobDelay($job);
+            $delayMilliseconds = $delay === null ? null : $this->delayMilliseconds($delay);
+            $this->assertDelayPlugin($delayMilliseconds);
             $payload = $this->createPayload($job, $queueName, $data, $delay);
 
             return [
@@ -313,7 +320,7 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
                     $route,
                     $queueName,
                     ['content_type' => self::CONTENT_TYPE_JSON],
-                    $delay === null ? null : $this->delayMilliseconds($delay),
+                    $delayMilliseconds,
                 ),
             ];
         }, $jobs);
@@ -602,7 +609,41 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
 
     public function __destruct()
     {
+        $this->logPendingPublishErrors();
         $this->closeConsumers();
+    }
+
+    /**
+     * Last-resort net at process teardown: pipelined publish outcomes surface
+     * at the next operation, and a process whose final publish was returned
+     * as unroutable (or otherwise failed) without a follow-up operation would
+     * otherwise take the record to the grave — a lone safe-mode dispatch in a
+     * CLI one-shot or an FPM request that never touches the queue again was
+     * lost silently (probe F of the 0.2.2 safety-mode matrix). Destructors
+     * cannot propagate exceptions, so each unsurfaced record is logged at
+     * error level with its native context instead of being thrown.
+     */
+    private function logPendingPublishErrors(): void
+    {
+        // Same typed-property initialization check as drainSettlementErrors:
+        // unit tests construct the queue without a container.
+        if (! isset($this->container)) { // @phpstan-ignore-line
+            return;
+        }
+
+        try {
+            $errors = $this->pool->drainErrors();
+            foreach ($errors as $error) {
+                $this->container->make('log')->error(
+                    'rabbit-rs: publication outcome never surfaced before process teardown',
+                    $error,
+                );
+            }
+        } catch (\Throwable) {
+            // Best-effort: the pool may already be closed or the container
+            // partially torn down. The record is lost either way — surfacing
+            // it must never fail the process teardown.
+        }
     }
 
     /**
@@ -627,6 +668,8 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
         array $options,
         ?int $delayMilliseconds = null,
     ): string {
+        $this->assertDelayPlugin($delayMilliseconds);
+
         $queueName = $this->queueName($queue);
         $message = $this->messages->map(
             $payload,
@@ -685,5 +728,22 @@ class RabbitMqQueue extends Queue implements ClearableQueue, QueueContract
         }
 
         return $seconds * 1000;
+    }
+
+    /**
+     * Plugin mode loses every deferred message when the broker lacks the
+     * delayed-message plugin, so a delayed publish refuses loudly instead.
+     * The other modes never reach the guard: auto resolved its mode against
+     * the broker at connection compile time (degrading to ttl without the
+     * plugin), and ttl routes through bucket queues without the plugin.
+     * An undelayed publish takes neither strategy.
+     */
+    private function assertDelayPlugin(?int $delayMilliseconds): void
+    {
+        if ($delayMilliseconds === null || $this->delayMode !== 'plugin') {
+            return;
+        }
+
+        DelayPluginGuard::assertPluginEnabled((string) $this->connectionName);
     }
 }

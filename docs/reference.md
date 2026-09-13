@@ -36,7 +36,7 @@ ProcessOrder::dispatch($order)->onQueue('orders.high');
 ProcessOrder::dispatch($order)->delay(now()->addMinutes(5));
 ```
 
-Delayed jobs use the configured delay mode: `auto` and `plugin` publish through the `x-delayed-message` exchange, `ttl` uses bucketed TTL queues (use `ttl` when the plugin is not installed). See [Topology — Delay routing](#delay-routing).
+Delayed jobs use the configured delay mode: `auto` verifies the `rabbitmq_delayed_message_exchange` plugin against the management API at connection compile time and publishes through the `x-delayed-message` exchange only when present (otherwise it degrades to `ttl` bucket queues), `plugin` refuses the delayed publish loudly when the management API proves the plugin absent, and `ttl` uses bucketed TTL queues. See [Topology — Delay routing](#delay-routing).
 
 #### Dispatch in bulk
 
@@ -787,8 +787,8 @@ Delay configuration is per connection, with `mode`, `buckets`,
 ],
 ```
 
-- `auto` — publish delayed messages through the `x-delayed-message` exchange (same as `plugin`); use `ttl` when the plugin is not installed
-- `plugin` — require the plugin; fail if it is not installed
+- `auto` — publish delayed messages through the `x-delayed-message` exchange when the broker confirms the plugin (checked once per connection through the management API at connection compile time), degrading to the `ttl` bucket queues when the plugin is absent or unverifiable
+- `plugin` — require the plugin: the first delayed publish throws `DelayPluginMissingException` when the management API proves it absent
 - `ttl` — always use TTL queue buckets
 
 > **Note:** when `safety` is `blind`, delayed jobs are **not** honored — the
@@ -841,6 +841,40 @@ routing are **derived from it**, never set independently:
   bounded background pump and returns without waiting for any transport
   outcome. A transport failure after the hand-off is a silent loss. Delayed
   jobs are not honored in this mode.
+
+#### Where unroutable-publish failures surface (safe mode)
+
+In `safe` mode the broker returns every publication it cannot route
+(`mandatory` routing). The return is recorded as a definitive failure and
+never re-buffered; it surfaces at the earliest of:
+
+- **The publish itself**, when the outcome is already known synchronously:
+  `bulk()` and any explicit `flush()` (also `size()`/`clear()`, which flush
+  first) throw `QueueException` carrying the message id and the AMQP reply
+  code.
+- **The next queue operation** otherwise. Publishes are buffered and drained
+  in the background (`publisher.flush_interval`, 1 ms default), so a lone
+  `push()`
+  returns before the broker confirms. The definitive return then surfaces
+  from the next `push()`, `flush()`, `size()`, `clear()`, `stats()`, or
+  `pop()` (which drains pending publish errors first through
+  `drainSettlementErrors()`); `Pool::drainErrors()` reads the raw records
+  without throwing.
+- **Process teardown, as a guaranteed net.** A process whose final publish
+  was returned and that performs no further queue operation (a lone dispatch
+  in a CLI one-shot, or an FPM request that never touches the queue again)
+  would otherwise take the record with it: `RabbitMqQueue::__destruct()`
+  drains pending publish errors and logs each one at `error` level
+  (`rabbit-rs: publication outcome never surfaced before process teardown`,
+  with the native `kind`, `message_id`, and `message` context). A throw is
+  impossible at that point — destructors cannot propagate exceptions — so
+  the log entry plus the `returns_total` counter is the floor of the
+  contract.
+
+`stats()['returns_total']` counts every mandatory return for the process
+lifetime of the pool (`rabbit-rs:status` exposes it), and `rabbit-rs:doctor`
+reads the broker's own `return_unroutable` counter on the publish exchange —
+cross-process evidence that survives the death of the publishing process.
 
 See [Reliability](https://github.com/Goopil/php-rabbit-rs/blob/main/docs/reference.md#reliability) for the full contract.
 
@@ -1026,7 +1060,7 @@ Rabbit RS supports delayed message delivery via two strategies, selected by the 
 ],
 ```
 
-In `auto` mode, delayed messages are published through the `x-delayed-message` exchange, same as `plugin` mode (including its declare-mode topology, see below). Use `ttl` mode when the `rabbitmq_delayed_message_exchange` plugin is not installed.
+In `auto` mode the driver checks the broker for the `rabbitmq_delayed_message_exchange` plugin (management API overview, once per connection per process — only when a `management_url` is configured). With the plugin present, delayed messages are published through the `x-delayed-message` exchange, same as `plugin` mode (including its declare-mode topology, see below). Without the plugin — or when the plugin state cannot be verified (no `management_url`, or the management API is unreachable) — `auto` degrades to the `ttl` bucket queues at connection compile time, so a deferred job is never routed through the main queue and never silently lost to a missing plugin.
 
 #### Plugin mode
 
@@ -1050,6 +1084,8 @@ rabbitmq-plugins enable rabbitmq_delayed_message_exchange
 ```
 
 If the plugin is not installed, the exchange declare fails with a permanent error: in `declare` mode the pool connection fails during topology reconciliation, while in `external` and `verify` modes delayed publishes fail terminally with a transport error — the publisher stays ready and all other publishing (delayed or not) keeps working. Use `ttl` mode when the plugin cannot be installed.
+
+On the first delayed publish the driver additionally re-checks the plugin through the management API (verdict cached per connection for the process lifetime): when the API proves the plugin absent, the publish throws `DelayPluginMissingException` instead of losing the message — without the plugin every deferred publish is silently lost. When the plugin state cannot be verified (no `management_url`, or the management API is unreachable), the publish goes through unchanged with a one-time warning, so an unrelated management outage never breaks a working plugin setup.
 
 #### TTL mode (explicit)
 
@@ -1815,8 +1851,17 @@ php artisan rabbit-rs:doctor
 Both exit non-zero on failure and name the exact config path of anything
 missing — wire them into your deploy pipeline before the workers roll. In
 `declare` mode, `rabbit-rs:topology --fix` declares missing items through a
-transient consumer; in `verify`/`external` mode it is refused without
-`--force`, because those modes promise externally managed topology.
+transient consumer, then re-verifies every declared object before reporting
+success: each subscription queue through the passive probe, and (with
+`management_url`) the route exchange, its bindings and each queue's
+`x-queue-type` through the management API. `topology declared` is only
+printed once those checks confirm the objects on the broker — any object the
+declare failed to land prints its own failure line and fails the command
+(non-zero exit), so a repair run can never report a fix it did not make. A
+consumer-readiness timeout still only warns: the declaration lands before
+consumer channels start, so `--fix` stays usable before any worker exists.
+In `verify`/`external` mode `--fix` is refused without `--force`, because
+those modes promise externally managed topology.
 
 #### Which `topology_mode` per environment
 
