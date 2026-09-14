@@ -18,7 +18,7 @@ const BASE_QUEUE_CLASS = 'Goopil\RabbitRs\Laravel\RabbitMqQueue';
  * and without a broker, so the doctor's extension and broker probes are
  * substituted with configurable fakes.
  */
-function bindFakeProbe($app, bool $loaded = true, ?string $version = '0.3.4', ?string $brokerError = null, ?RuntimeException $canaryError = null): void
+function bindFakeProbe($app, bool $loaded = true, ?string $version = '0.3.5', ?string $brokerError = null, ?RuntimeException $canaryError = null): void
 {
     $app->instance(DoctorProbe::class, new class($loaded, $version, $brokerError, $canaryError) extends DoctorProbe
     {
@@ -150,7 +150,7 @@ describe('rabbit-rs:doctor broker probe', function () {
         doctorConnection();
 
         $this->artisan('rabbit-rs:doctor')
-            ->expectsOutputToContain('^0.3.4')
+            ->expectsOutputToContain('^0.3.5')
             ->assertExitCode(1);
     });
 
@@ -158,7 +158,7 @@ describe('rabbit-rs:doctor broker probe', function () {
         doctorConnection();
 
         $this->artisan('rabbit-rs:doctor')
-            ->expectsOutputToContain('0.3.4')
+            ->expectsOutputToContain('0.3.5')
             ->assertExitCode(0);
     });
 });
@@ -350,12 +350,12 @@ describe('rabbit-rs:doctor dead-letter canary', function () {
         Artisan::call('rabbit-rs:doctor');
         $output = Artisan::output();
 
-        expect($output)->toContain('dead-letter canary: delivered')
+        expect($output)->toContain('dead-letter canary: delivered, rejected, and received on the configured DLQ')
             ->and(Artisan::call('rabbit-rs:doctor'))->toBe(0);
     });
 
     it('fails when the canary does not land in the dead-letter queue', function () {
-        bindFakeProbe($this->app, canaryError: new RuntimeException('canary message not found in DLQ — the whole queue was scanned and the dead-lettered canary is gone'));
+        bindFakeProbe($this->app, canaryError: new RuntimeException('dead-lettered canary never reached the DLX — the dead-letter wiring is broken (the canary DLQ was empty), so dead-lettered messages would vanish'));
         doctorDeadLetterConnection();
 
         Artisan::call('rabbit-rs:doctor');
