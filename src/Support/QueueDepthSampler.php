@@ -7,6 +7,7 @@ namespace Goopil\RabbitRs\Laravel\Support;
 use Closure;
 use Goopil\RabbitRs\Laravel\Config\ConnectionCompiler;
 use Goopil\RabbitRs\Pool;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Per-connection ready-depth sampler for the rabbit-rs:work auto-scaler.
@@ -14,7 +15,8 @@ use Goopil\RabbitRs\Pool;
  * Two sources, chosen per connection, summed over the connection's planned
  * queues:
  *
- * 1. The RabbitMQ management API (`messages_ready`) when the connection
+ * 1. The RabbitMQ management API (pending depth: `messages_ready` plus
+ *    `messages_unacknowledged`, #308) when the connection
  *    configures `management_url` — the zero-AMQP source, and the only one
  *    that still counts after every worker has exited (the one-shot final
  *    depth check).
@@ -25,9 +27,9 @@ use Goopil\RabbitRs\Pool;
  *    the connection's socket timeout.
  *
  * Every lookup degrades to null (request failure, unreachable broker,
- * missing queue, extension absent, config unusable): the caller silently
- * leaves the connection out of scaling, no warning — same contract as the
- * management API. A configured-but-failing management endpoint therefore
+ * missing queue, extension absent): the caller silently leaves the
+ * connection out of scaling — same contract as the management API. A
+ * configured-but-failing management endpoint therefore
  * disables scaling for that connection rather than cascading into the
  * native probe. The supervisor never publishes, so its probe pools hold no
  * publish buffer and need no force-flush before size().
@@ -165,12 +167,15 @@ final class QueueDepthSampler
      */
     private function probeNativePool(string $connection, string $queue): ?int
     {
-        if (! extension_loaded('rabbit_rs')) {
+        // Compile check first: an unusable config is an operator error and
+        // must warn (#310) even when the extension is absent (where the
+        // probe would degrade to null anyway).
+        $nativeConfig = $this->nativeConfig($connection);
+        if ($nativeConfig === null) {
             return null;
         }
 
-        $nativeConfig = $this->nativeConfig($connection);
-        if ($nativeConfig === null) {
+        if (! extension_loaded('rabbit_rs')) {
             return null;
         }
 
@@ -221,7 +226,12 @@ final class QueueDepthSampler
 
         try {
             $compiled = ConnectionCompiler::compile($connection, $config, RabbitRsConnections::packageDefaults());
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
+            // A config that does not compile is an operator error, not
+            // environmental noise (issue #310): say why the connection is
+            // being dropped from scaling instead of degrading silently.
+            Log::warning("rabbit-rs: connection [{$connection}] config is unusable for depth sampling, scaling skipped: {$e->getMessage()}");
+
             return $this->nativeConfigs[$connection] = null;
         }
 

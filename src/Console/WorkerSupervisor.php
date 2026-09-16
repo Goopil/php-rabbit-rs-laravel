@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Goopil\RabbitRs\Laravel\Console;
 
 use Goopil\RabbitRs\Laravel\Exceptions\SupervisorException;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 
 /**
@@ -46,6 +47,19 @@ class WorkerSupervisor
      * child that has not exited yet.
      */
     private const STOP_ESCALATION_SECONDS = 15.0;
+
+    /**
+     * How long the one-shot drain check keeps polling the depth after it saw
+     * a fresh zero: the broker requeues an in-flight window seconds after the
+     * consumers leave, and quorum-queue gauges lag — concluding drained on
+     * the first zero strands that window (#308).
+     */
+    private const DRAIN_CONVERGENCE_SECONDS = 15.0;
+
+    /**
+     * Interval between the fresh depth polls of the drain convergence window.
+     */
+    private const DRAIN_CONVERGENCE_POLL_SECONDS = 1.0;
 
     private readonly int $initialWorkers;
 
@@ -290,6 +304,10 @@ class WorkerSupervisor
         while (true) {
             $process->wait();
 
+            if (! $this->isCleanExit($process)) {
+                $this->reportNonCleanExit(0, $process);
+            }
+
             if ($this->isOneShot()) {
                 // Once mode: the child's exit is terminal, its status is the
                 // supervisor's.
@@ -433,6 +451,28 @@ class WorkerSupervisor
     }
 
     /**
+     * Poll the depth fresh for a bounded window after the drain check saw a
+     * zero: the broker requeues an in-flight window seconds after the
+     * consumers leave, so the first zero can be a lag artifact, not a
+     * drained plan (#308). Returns early on the first non-zero reading (or
+     * a failed probe, which the inconclusive-retry budget handles) and on
+     * shutdown.
+     */
+    private function waitForDrainConvergence(\Closure $isShutdown): int
+    {
+        $deadline = microtime(true) + self::DRAIN_CONVERGENCE_SECONDS;
+        while (! $isShutdown() && microtime(true) < $deadline) {
+            usleep((int) (self::DRAIN_CONVERGENCE_POLL_SECONDS * 1_000_000));
+            $pending = $this->pendingDepth(fresh: true);
+            if ($pending !== 0) {
+                return $pending;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
      * Once mode: every child runs exactly once and is never restarted — a
      * clean exit removes its slot, a crash is remembered as the command's
      * exit status without touching the other children. When the fleet drains,
@@ -478,6 +518,10 @@ class WorkerSupervisor
                 $maxExit = $maxExit === null ? $exit : max($maxExit, $exit);
                 unset($slots[$index]);
 
+                if ($exit !== self::EXIT_CLEAN) {
+                    $this->reportNonCleanExit($index, $slot['process']);
+                }
+
                 // A clean exit means the child consumed a job — observed
                 // progress the re-arm budget renews on. Crashed children
                 // consumed nothing, so they never renew the budget.
@@ -492,6 +536,13 @@ class WorkerSupervisor
                     // The memoized read can be a stale 0 or a memoized failed probe:
                     // re-probe uncached before concluding the plan is drained (#287).
                     $pending = $this->pendingDepth(fresh: true);
+                }
+                if ($pending === 0) {
+                    // The ready gauge hits 0 while the fleet's in-flight window
+                    // is still unacked: the broker requeues it seconds after the
+                    // consumers leave and quorum gauges lag. Poll fresh for a
+                    // bounded window before concluding drained (#308).
+                    $pending = $this->waitForDrainConvergence($isShutdown);
                 }
                 if ($pending > 0
                     && ($reArms < self::MAX_ONE_SHOT_REARMS
@@ -768,11 +819,17 @@ class WorkerSupervisor
                 $slot['restartAt'] = 0.0;
                 $slots[$index] = $this->restartSlot($index, $slot);
             }
-        } elseif (! $this->shouldRestart($slot['restarts'])) {
-            $this->stopAllSlots($slots);
-
-            return self::EXIT_MAX_RESTARTS;
         } else {
+            // First observation of this crash (the backoff-wait branch above
+            // only re-visits an already-reported one).
+            $this->reportNonCleanExit($index, $slot['process']);
+
+            if (! $this->shouldRestart($slot['restarts'])) {
+                $this->stopAllSlots($slots);
+
+                return self::EXIT_MAX_RESTARTS;
+            }
+
             // Schedule the restart with its backoff; the loop keeps
             // polling the other children meanwhile (non-blocking backoff).
             $slot['restartAt'] = $now + $this->backoffSeconds($slot['restarts']);
@@ -810,6 +867,20 @@ class WorkerSupervisor
                 $slot['process']->stop(10, SIGTERM);
             }
         }
+    }
+
+    /**
+     * A worker died on a non-clean exit: surface it loudly. Issue #310 — a
+     * misconfigured child (e.g. a broken env JSON value) used to die silently
+     * because the supervisor never emitted its stderr anywhere.
+     */
+    private function reportNonCleanExit(int $workerIndex, Process $process): void
+    {
+        $exit = $process->getExitCode() ?? self::EXIT_CLEAN;
+        Log::error("rabbit-rs: worker exited with status {$exit}", [
+            'worker_index' => $workerIndex,
+            'stderr' => trim($process->getErrorOutput()),
+        ]);
     }
 
     /**
