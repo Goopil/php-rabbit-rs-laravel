@@ -50,7 +50,7 @@ $jobs = [
     new ProcessOrder(3),
 ];
 
-// Bulk dispatch — a single native call for all immediate jobs
+// Bulk dispatch — native publishBatch calls chunked under the batch limits
 Queue::connection('rabbit-rs')->bulk($jobs);
 ```
 
@@ -164,7 +164,11 @@ $messageIds = Queue::connection('rabbit-rs')->bulk([
 ], '', 'orders.high');
 ```
 
-Bulk publishing uses a single native call (`publishBatch`) for all immediate jobs. Jobs marked `dispatchAfterCommit` are deferred to the transaction commit callback.
+Bulk publishing sends the immediate jobs through `publishBatch` in chunks that respect the native batch bounds: at most **256 messages** and **1 MiB of cumulative payload** per native call. The native layer rejects any single call beyond either bound wholesale (validation precedes send: nothing is published), so a bulk past the bounds is split into consecutive calls; a bulk within the bounds stays a single call. A single payload larger than 1 MiB cannot be split — its chunk fails with the native per-message error naming the limit.
+
+Delivery stays at-least-once with **partial success** on a mid-bulk failure: if a chunk fails after earlier chunks were published, those publications remain and the failure surfaces to the caller. Retrying the bulk re-publishes every job — the stable `message_id` makes the duplicates identifiable.
+
+Jobs marked `dispatchAfterCommit` are deferred to the transaction commit callback (chunked the same way at commit time).
 
 #### pop
 
@@ -471,14 +475,14 @@ The minimal connection is therefore:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `driver` | string | — | Must be `rabbit-rs` |
-| `queue` | string | — (required) | Default queue name: the derived consumer subscription and the `pop()` target |
+| `queue` | string | — (required without `subscriptions`) | Default queue name: the derived consumer subscription and the `pop()` target. With `subscriptions` it is optional and must name one of their queues (see [validation and strict errors](#validation-and-strict-errors)) |
 | `hosts` | string or string[] | `127.0.0.1:5672` | Comma-separated `host:port` list (a bare host defaults to port 5672); IPv6 must be bracketed (`[::1]:5672`) |
 | `vhost` | string | `/` | AMQP virtual host (a distinct vhost = a distinct AMQP connection) |
 | `username` | string | `guest` | AMQP username |
 | `password` | string | `guest` | AMQP password |
 | `tls` | array | package defaults | `enabled`, `ca_cert`, `client_cert`, `client_key` (see [TLS](#tls)) |
 | `heartbeat` | int (seconds) | `30` | AMQP heartbeat; positive integer |
-| `management_url` | ?string | `null` | Laravel-only: RabbitMQ management API base URL for `rabbit-rs:status` (never sent to the native extension) |
+| `management_url` | ?string | `null` | Laravel-only: RabbitMQ management API base URL (never sent to the native extension). Optional: features that consult it fall back to native AMQP probes without it — see [Management API usage](management-api.md) |
 | `exchange` | ?string | `laravel.jobs` | Publishing exchange; `null` publishes through the default exchange |
 | `routing_key` | ?string | `{queue}` | `{queue}` is replaced with the queue name at publish time; `null` means no routing key (default-exchange/fanout usage) |
 | `safety` | string | `safe` | `safe` (confirms + mandatory), `unsafe` (no confirms, no mandatory — synchronous socket write), `blind` (fire-and-forget) |
@@ -677,7 +681,6 @@ tuning. The alias is the array key; the broker is always this connection
 ```php
 'orders-eu' => [
     'driver' => 'rabbit-rs',
-    'queue' => 'orders',
     'hosts' => 'rabbit-1:5672',
     'vhost' => '/orders-eu',
     'username' => 'orders',
@@ -707,7 +710,10 @@ tuning. The alias is the array key; the broker is always this connection
 | `no_ack` | `false` | Requires `early_ack` **and** `best_effort` |
 
 Without the escape hatch, one subscription named `default` is derived from the
-connection's `queue`. With it, the list replaces the derivation. Rules:
+connection's `queue`. With it, the list replaces the derivation and the
+`queue` key becomes optional: when kept, it must name one of the subscription
+queues (or compilation fails with the two remediations — remove the key, or
+add it as a subscription). Rules:
 at least one entry, unique queues across aliases, unknown fields rejected.
 
 ### Implicit profiles
@@ -830,7 +836,13 @@ php artisan rabbit-rs:status --format=json
 ```
 
 `management_url` is Laravel-only: it is validated on the connection but never
-propagated to the native extension. `null` or blank disables the feature. See
+propagated to the native extension. `null` or blank disables the HTTP feature,
+and every feature that consults the API falls back to native AMQP probes
+(delay-plugin probe, doctor dead-letter canary, topology exchange checks) —
+except the cross-process queue counters above, which are management-API-only
+(pure AMQP exposes no cumulative broker counters). See
+[Management API usage](management-api.md) for the per-feature matrix and the
+protocol-impossible gaps. See
 [Reliability — Measuring duplicates](https://github.com/Goopil/php-rabbit-rs/blob/main/docs/reference.md#measuring-duplicates) for
 what the counters mean.
 
@@ -905,7 +917,11 @@ and only when the affected connection is resolved:
 - `early_ack` requires `best_effort`; `no_ack` requires `early_ack` and
   `best_effort`.
 - `subscriptions` must contain at least one entry, with unique queues across
-  aliases.
+  aliases. The `queue` key is then optional; when present it must name one of
+  the subscription queues — otherwise compilation fails naming
+  `queue.connections.<name>.queue` with the two remediations (remove the key,
+  or add it as a subscription). Without `subscriptions`, the `queue` key is
+  required (it names the derived subscription).
 
 ### Pool reuse and fingerprints
 

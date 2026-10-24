@@ -10,6 +10,7 @@ use Goopil\RabbitRs\Laravel\Events\BackpressureDetected;
 use Goopil\RabbitRs\Laravel\Events\ConnectionStateChanged;
 use Goopil\RabbitRs\Laravel\Horizon\RabbitMqQueue as HorizonRabbitMqQueue;
 use Goopil\RabbitRs\Laravel\RabbitMqServiceProvider;
+use Goopil\RabbitRs\Laravel\Support\ExtensionConstraint;
 use Goopil\RabbitRs\Laravel\Support\RabbitRsConnections;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
@@ -108,8 +109,9 @@ final class RabbitMqDoctorCommand extends Command
         $brokerError = $this->checkBroker($compiled, $probe, $extensionUsable);
         $managementUsable = $this->checkManagement($config);
         $this->checkPublishOutcomes($compiled, $config, $managementUsable);
+
         $this->checkTopology($compiled, $brokerError);
-        $this->checkDeadLetterCanary($name, $compiled, $config, $probe, $brokerError, $managementUsable);
+        $this->checkDeadLetterCanary($name, $compiled, $config, $probe, $brokerError);
         $this->checkSafety($compiled);
         $this->checkHorizon($name, $workerClass, $compiled);
         $this->checkEvents();
@@ -126,7 +128,7 @@ final class RabbitMqDoctorCommand extends Command
 
         $version = $probe->extensionVersion() ?? 'unknown';
         $constraint = RabbitMqServiceProvider::EXTENSION_CONSTRAINT;
-        if (! $this->satisfiesCaret($version, $constraint)) {
+        if (! ExtensionConstraint::satisfiesCaret($version, $constraint)) {
             $this->emit('fail', "extension version {$version} does not satisfy the composer requirement ext-rabbit_rs {$constraint}");
 
             return false;
@@ -359,9 +361,10 @@ final class RabbitMqDoctorCommand extends Command
      * Behavioral dead-letter probe: publishes, terminally rejects, and
      * asserts DLQ delivery — the only check that exercises the whole chain
      * (queue args → DLX → binding → DLQ) instead of inspecting its parts.
-     * Skipped without a reachable broker, without a usable management API
-     * (DLQ delivery is verified through it), or when no dead_letter topology
-     * is configured (checkTopology already warns about that gap).
+     * Skipped without a reachable broker or when no dead_letter topology
+     * is configured (checkTopology already warns about that gap). The
+     * verification path follows the connection: management API when
+     * `management_url` is set, native AMQP operations otherwise.
      *
      * @param  array<string, mixed>  $compiled
      * @param  array<string, mixed>  $config
@@ -372,10 +375,9 @@ final class RabbitMqDoctorCommand extends Command
         array $config,
         DoctorProbe $probe,
         ?string $brokerError,
-        bool $managementUsable,
     ): void {
         $deadLetter = $compiled['topology']['dead_letter'] ?? null;
-        if (! is_array($deadLetter) || $brokerError !== null || ! $managementUsable) {
+        if (! is_array($deadLetter) || $brokerError !== null) {
             return;
         }
 
@@ -602,29 +604,6 @@ final class RabbitMqDoctorCommand extends Command
                 $this->emit('warn', "no listener registered for {$short} — the event is dispatched but unobserved");
             }
         }
-    }
-
-    /**
-     * Composer caret constraint check, limited to the ^major.minor[.patch]
-     * shape the package pins (ext-rabbit_rs ^0.3.10): on 0.x the caret admits
-     * only the declared minor. Unknown shapes pass — the doctor reports the
-     * version instead of guessing.
-     */
-    private function satisfiesCaret(string $version, string $constraint): bool
-    {
-        if (preg_match('/^\^(\d+)\.(\d+)(?:\.(\d+))?$/', $constraint, $matches) !== 1) {
-            return true;
-        }
-
-        $major = (int) $matches[1];
-        $minor = (int) $matches[2];
-        $floor = sprintf('%d.%d.%d', $major, $minor, (int) ($matches[3] ?? 0));
-        $ceiling = $major > 0
-            ? sprintf('%d.0.0', $major + 1)
-            : sprintf('0.%d.0', $minor + 1);
-
-        return version_compare($version, $floor, '>=')
-            && version_compare($version, $ceiling, '<');
     }
 
     /**
