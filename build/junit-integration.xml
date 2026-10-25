@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="CLI Arguments" tests="48" assertions="337" errors="0" failures="0" skipped="3" time="193.324541">
+    <testsuite name="Tests\Integration\AtLeastOnceChaosTest" file="tests/Integration/AtLeastOnceChaosTest.php" tests="10" assertions="45" errors="0" failures="0" skipped="0" time="116.258904">
+      <testcase name="it recovers from TCP reset before publisher confirm" file="tests/Integration/AtLeastOnceChaosTest.php::it recovers from TCP reset before publisher confirm" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="4" time="76.683632">
+        <system-out>
+[tcp-reset-before-confirm] PASS: missing = 0, received = 1, duplicates = 0
+</system-out>
+      </testcase>
+      <testcase name="it redelivers after TCP reset between confirm and ACK" file="tests/Integration/AtLeastOnceChaosTest.php::it redelivers after TCP reset between confirm and ACK" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="4" time="3.716338">
+        <system-out>
+[tcp-reset-after-confirm-before-ack] PASS: missing = 0
+</system-out>
+      </testcase>
+      <testcase name="it survives quorum leader shutdown" file="tests/Integration/AtLeastOnceChaosTest.php::it survives quorum leader shutdown" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="14.658316">
+        <system-out>
+[quorum-leader-shutdown] PASS: missing = 0, received = 2, duplicates = 0
+</system-out>
+      </testcase>
+      <testcase name="it survives node restart" file="tests/Integration/AtLeastOnceChaosTest.php::it survives node restart" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="11.585773">
+        <system-out>
+[node-restart] PASS: missing = 0, received = 2, duplicates = 0
+</system-out>
+      </testcase>
+      <testcase name="it redelivers after consumer network partition" file="tests/Integration/AtLeastOnceChaosTest.php::it redelivers after consumer network partition" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="2.662822">
+        <system-out>
+[consumer-partition] PASS: missing = 0
+</system-out>
+      </testcase>
+      <testcase name="it publishes after channel closed for topology error" file="tests/Integration/AtLeastOnceChaosTest.php::it publishes after channel closed for topology error" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="0.074736">
+        <system-out>
+[channel-closed-topology-error] PASS: missing = 0
+</system-out>
+      </testcase>
+      <testcase name="it works with delay plugin unavailable" file="tests/Integration/AtLeastOnceChaosTest.php::it works with delay plugin unavailable" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="2" time="0.046735">
+        <system-out>
+[delay-plugin-unavailable] PASS: missing = 0
+</system-out>
+      </testcase>
+      <testcase name="it rejects bad credentials and delivers with good credentials" file="tests/Integration/AtLeastOnceChaosTest.php::it rejects bad credentials and delivers with good credentials" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="0.054839">
+        <system-out>
+[credentials-rejected] PASS: bad credentials correctly rejected
+
+[credentials-rejected] PASS: missing = 0 with good credentials
+</system-out>
+      </testcase>
+      <testcase name="it redelivers after worker SIGTERM with unacked jobs" file="tests/Integration/AtLeastOnceChaosTest.php::it redelivers after worker SIGTERM with unacked jobs" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="3" time="3.107418">
+        <system-out>
+[worker-sigterm-unacked] PASS: missing = 0
+</system-out>
+      </testcase>
+      <testcase name="it recovers when killed mid-consume, rejects stale acks, and redelivers unacked work" file="tests/Integration/AtLeastOnceChaosTest.php::it recovers when killed mid-consume, rejects stale acks, and redelivers unacked work" class="Tests\Integration\AtLeastOnceChaosTest" classname="Tests.Integration.AtLeastOnceChaosTest" assertions="17" time="3.668294">
+        <system-out>
+[kill-mid-consume] PASS: missing = 0, received = 6, duplicates = 0
+
+[kill-mid-consume] stale acks thrown at call = 3/3, reconnects = 1
+</system-out>
+      </testcase>
+    </testsuite>
+    <testsuite name="Tests\Integration\ConsumerDrainAheadTest" file="tests/Integration/ConsumerDrainAheadTest.php" tests="1" assertions="11" errors="0" failures="0" skipped="0" time="10.210634">
+      <testcase name="it delivers buffered siblings in FIFO order with per-job acks" file="tests/Integration/ConsumerDrainAheadTest.php::it delivers buffered siblings in FIFO order with per-job acks" class="Tests\Integration\ConsumerDrainAheadTest" classname="Tests.Integration.ConsumerDrainAheadTest" assertions="11" time="10.210634"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\ConsumerRejoinTest" file="tests/Integration/ConsumerRejoinTest.php" tests="1" assertions="4" errors="0" failures="0" skipped="0" time="10.589756">
+      <testcase name="it rejoins a recovered broker after the cached consumer retires" file="tests/Integration/ConsumerRejoinTest.php::it rejoins a recovered broker after the cached consumer retires" class="Tests\Integration\ConsumerRejoinTest" classname="Tests.Integration.ConsumerRejoinTest" assertions="4" time="10.589756"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\DelayPluginGuardTest" file="tests/Integration/DelayPluginGuardTest.php" tests="7" assertions="6" errors="0" failures="0" skipped="3" time="4.474618">
+      <testcase name="it auto mode routes delayed jobs into ttl buckets on a plugin-less broker" file="tests/Integration/DelayPluginGuardTest.php::it auto mode routes delayed jobs into ttl buckets on a plugin-less broker" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="0" time="0.046390">
+        <skipped/>
+      </testcase>
+      <testcase name="it auto mode resolves the ttl strategy against the plugin-less broker" file="tests/Integration/DelayPluginGuardTest.php::it auto mode resolves the ttl strategy against the plugin-less broker" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="0" time="0.017810">
+        <skipped/>
+      </testcase>
+      <testcase name="it auto mode resolves the plugin strategy against a plugin-enabled broker" file="tests/Integration/DelayPluginGuardTest.php::it auto mode resolves the plugin strategy against a plugin-enabled broker" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="1" time="0.060107"/>
+      <testcase name="it resolves the native probe verdict in a plain child process without recursing" file="tests/Integration/DelayPluginGuardTest.php::it resolves the native probe verdict in a plain child process without recursing" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="3" time="0.181607"/>
+      <testcase name="it plugin mode refuses the delayed publish when the plugin is absent" file="tests/Integration/DelayPluginGuardTest.php::it plugin mode refuses the delayed publish when the plugin is absent" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="0" time="0.011490">
+        <skipped/>
+      </testcase>
+      <testcase name="it plugin mode publishes when the plugin is present" file="tests/Integration/DelayPluginGuardTest.php::it plugin mode publishes when the plugin is present" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="1" time="2.071822"/>
+      <testcase name="it plugin mode publishes through when the management api is unreachable" file="tests/Integration/DelayPluginGuardTest.php::it plugin mode publishes through when the management api is unreachable" class="Tests\Integration\DelayPluginGuardTest" classname="Tests.Integration.DelayPluginGuardTest" assertions="1" time="2.085391"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\DelayedJobTest" file="tests/Integration/DelayedJobTest.php" tests="2" assertions="3" errors="0" failures="0" skipped="0" time="3.781114">
+      <testcase name="it publishes and consumes after delay" file="tests/Integration/DelayedJobTest.php::it publishes and consumes after delay" class="Tests\Integration\DelayedJobTest" classname="Tests.Integration.DelayedJobTest" assertions="2" time="3.692389"/>
+      <testcase name="it behaves like push with zero delay" file="tests/Integration/DelayedJobTest.php::it behaves like push with zero delay" class="Tests\Integration\DelayedJobTest" classname="Tests.Integration.DelayedJobTest" assertions="1" time="0.088725"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\DoctorDlxCanaryTest" file="tests/Integration/DoctorDlxCanaryTest.php" tests="8" assertions="176" errors="0" failures="0" skipped="0" time="3.299075">
+      <testcase name="it proves the configured dead-letter wiring end-to-end through the doctor canary" file="tests/Integration/DoctorDlxCanaryTest.php::it proves the configured dead-letter wiring end-to-end through the doctor canary" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="4" time="0.348762"/>
+      <testcase name="it finds the canary behind a foreign DLQ backlog" file="tests/Integration/DoctorDlxCanaryTest.php::it finds the canary behind a foreign DLQ backlog" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="43" time="0.474679"/>
+      <testcase name="it verifies the wiring through the canary DLQ when the configured DLQ backlog outgrows the scan window" file="tests/Integration/DoctorDlxCanaryTest.php::it verifies the wiring through the canary DLQ when the configured DLQ backlog outgrows the scan window" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="115" time="0.915818"/>
+      <testcase name="it purges and deletes its canary DLQ after the check so nothing accumulates" file="tests/Integration/DoctorDlxCanaryTest.php::it purges and deletes its canary DLQ after the check so nothing accumulates" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="2" time="0.144895"/>
+      <testcase name="it fails loud when the dead-letter wiring is broken" file="tests/Integration/DoctorDlxCanaryTest.php::it fails loud when the dead-letter wiring is broken" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="3" time="0.133173"/>
+      <testcase name="it proves the dead-letter wiring end-to-end without a management_url through the native path" file="tests/Integration/DoctorDlxCanaryTest.php::it proves the dead-letter wiring end-to-end without a management_url through the native path" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="4" time="0.607160"/>
+      <testcase name="it purges and deletes its canary DLQ after the native-path check" file="tests/Integration/DoctorDlxCanaryTest.php::it purges and deletes its canary DLQ after the native-path check" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="2" time="0.526163"/>
+      <testcase name="it fails loud on broken wiring without a management_url" file="tests/Integration/DoctorDlxCanaryTest.php::it fails loud on broken wiring without a management_url" class="Tests\Integration\DoctorDlxCanaryTest" classname="Tests.Integration.DoctorDlxCanaryTest" assertions="3" time="0.148426"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\PoisonDeliveryTest" file="tests/Integration/PoisonDeliveryTest.php" tests="3" assertions="15" errors="0" failures="0" skipped="0" time="15.349909">
+      <testcase name="it dead-letters an unmarshable delivery when a dead-letter exchange is configured" file="tests/Integration/PoisonDeliveryTest.php::it dead-letters an unmarshable delivery when a dead-letter exchange is configured" class="Tests\Integration\PoisonDeliveryTest" classname="Tests.Integration.PoisonDeliveryTest" assertions="6" time="6.158147"/>
+      <testcase name="it acknowledges an unmarshable delivery when no dead-letter exchange is configured" file="tests/Integration/PoisonDeliveryTest.php::it acknowledges an unmarshable delivery when no dead-letter exchange is configured" class="Tests\Integration\PoisonDeliveryTest" classname="Tests.Integration.PoisonDeliveryTest" assertions="5" time="6.095230"/>
+      <testcase name="it fails a job that always throws when the maximum number of tries is reached" file="tests/Integration/PoisonDeliveryTest.php::it fails a job that always throws when the maximum number of tries is reached" class="Tests\Integration\PoisonDeliveryTest" classname="Tests.Integration.PoisonDeliveryTest" assertions="4" time="3.096533"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\PublishErrorSurfacingTest" file="tests/Integration/PublishErrorSurfacingTest.php" tests="3" assertions="12" errors="0" failures="0" skipped="0" time="0.386282">
+      <testcase name="it surfaces an unroutable mandatory publish at the next pop" file="tests/Integration/PublishErrorSurfacingTest.php::it surfaces an unroutable mandatory publish at the next pop" class="Tests\Integration\PublishErrorSurfacingTest" classname="Tests.Integration.PublishErrorSurfacingTest" assertions="5" time="0.167816"/>
+      <testcase name="it surfaces a returned batch through drainSettlementErrors" file="tests/Integration/PublishErrorSurfacingTest.php::it surfaces a returned batch through drainSettlementErrors" class="Tests\Integration\PublishErrorSurfacingTest" classname="Tests.Integration.PublishErrorSurfacingTest" assertions="4" time="0.158089"/>
+      <testcase name="it surfaces a lone unroutable publish at the next queue operation" file="tests/Integration/PublishErrorSurfacingTest.php::it surfaces a lone unroutable publish at the next queue operation" class="Tests\Integration\PublishErrorSurfacingTest" classname="Tests.Integration.PublishErrorSurfacingTest" assertions="3" time="0.060378"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\QueueWorkerTest" file="tests/Integration/QueueWorkerTest.php" tests="7" assertions="22" errors="0" failures="0" skipped="0" time="6.483565">
+      <testcase name="it pushes then pops and deletes" file="tests/Integration/QueueWorkerTest.php::it pushes then pops and deletes" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="6" time="3.079130"/>
+      <testcase name="it preserves raw payload when pushing raw" file="tests/Integration/QueueWorkerTest.php::it preserves raw payload when pushing raw" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="2" time="0.068103"/>
+      <testcase name="it bulk publishes then consumes all" file="tests/Integration/QueueWorkerTest.php::it bulk publishes then consumes all" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="7" time="3.093830"/>
+      <testcase name="it requeues the job on release" file="tests/Integration/QueueWorkerTest.php::it requeues the job on release" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="2" time="0.091435"/>
+      <testcase name="it returns size zero after clear" file="tests/Integration/QueueWorkerTest.php::it returns size zero after clear" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="1" time="0.051676"/>
+      <testcase name="it increases size after push" file="tests/Integration/QueueWorkerTest.php::it increases size after push" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="3" time="0.051282"/>
+      <testcase name="it keeps the queue empty when clear purges buffered publications" file="tests/Integration/QueueWorkerTest.php::it keeps the queue empty when clear purges buffered publications" class="Tests\Integration\QueueWorkerTest" classname="Tests.Integration.QueueWorkerTest" assertions="1" time="0.048110"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\RouteBindingTest" file="tests/Integration/RouteBindingTest.php" tests="2" assertions="12" errors="0" failures="0" skipped="0" time="3.894779">
+      <testcase name="`route binding declared by the pool` → it declares the publish route so a freshly declared queue is reachable" file="tests/Integration/RouteBindingTest.php::`route binding declared by the pool` → it declares the publish route so a freshly declared queue is reachable" class="Tests\Integration\RouteBindingTest" classname="Tests.Integration.RouteBindingTest" assertions="4" time="3.115030"/>
+      <testcase name="`topology command on the publish route` → it flags a deleted route binding in verify and re-declares it with --fix" file="tests/Integration/RouteBindingTest.php::`topology command on the publish route` → it flags a deleted route binding in verify and re-declares it with --fix" class="Tests\Integration\RouteBindingTest" classname="Tests.Integration.RouteBindingTest" assertions="8" time="0.779748"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\TopologyFixVerificationTest" file="tests/Integration/TopologyFixVerificationTest.php" tests="2" assertions="13" errors="0" failures="0" skipped="0" time="0.156872">
+      <testcase name="`topology --fix post-condition verification` → it confirms every declared object on the broker and exits 0 on a fresh topology" file="tests/Integration/TopologyFixVerificationTest.php::`topology --fix post-condition verification` → it confirms every declared object on the broker and exits 0 on a fresh topology" class="Tests\Integration\TopologyFixVerificationTest" classname="Tests.Integration.TopologyFixVerificationTest" assertions="9" time="0.100277"/>
+      <testcase name="`topology --fix post-condition verification` → it fails per object and never reports success for an un-declarable queue" file="tests/Integration/TopologyFixVerificationTest.php::`topology --fix post-condition verification` → it fails per object and never reports success for an un-declarable queue" class="Tests\Integration\TopologyFixVerificationTest" classname="Tests.Integration.TopologyFixVerificationTest" assertions="4" time="0.056595"/>
+    </testsuite>
+    <testsuite name="Tests\Integration\TwoConnectionsTest" file="tests/Integration/TwoConnectionsTest.php" tests="2" assertions="18" errors="0" failures="0" skipped="0" time="18.439033">
+      <testcase name="it keeps two connections isolated across brokers and vhosts" file="tests/Integration/TwoConnectionsTest.php::it keeps two connections isolated across brokers and vhosts" class="Tests\Integration\TwoConnectionsTest" classname="Tests.Integration.TwoConnectionsTest" assertions="10" time="12.232545"/>
+      <testcase name="it runs two consumers on one queue without tag collision" file="tests/Integration/TwoConnectionsTest.php::it runs two consumers on one queue without tag collision" class="Tests\Integration\TwoConnectionsTest" classname="Tests.Integration.TwoConnectionsTest" assertions="8" time="6.206489"/>
+    </testsuite>
+  </testsuite>
+</testsuites>
