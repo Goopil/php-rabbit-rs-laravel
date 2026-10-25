@@ -13,7 +13,7 @@
     ],
     "keywords": ["rabbitmq", "amqp", "laravel", "queue", "rust"],
     "require": {
-        "php": "^8.4",
+        "php": "^8.2",
         "illuminate/queue": "^12.0 || ^13.0",
         "illuminate/support": "^12.0 || ^13.0",
         "symfony/process": "^7.2 || ^8.0"
@@ -43,7 +43,7 @@
         }
     },
     "suggest": {
-        "ext-rabbit_rs": "Required to dispatch and consume jobs (^0.3.12). composer install succeeds without it; connections fail at resolution time until the native extension is loaded (pie install goopil/rabbit-rs-native).",
+        "ext-rabbit_rs": "Required to dispatch and consume jobs (^0.3.13). composer install succeeds without it; connections fail at resolution time until the native extension is loaded (pie install goopil/rabbit-rs-native).",
         "laravel/horizon": "Required to use the Horizon dashboard integration (worker=horizon)"
     },
     "scripts": {
